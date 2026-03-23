@@ -196,6 +196,11 @@ def is_musa() -> bool:
     return hasattr(torch.version, "musa") and torch.version.musa is not None
 
 
+@lru_cache(maxsize=1)
+def is_mps() -> bool:
+    return torch.backends.mps.is_available()
+
+
 def human_readable_int(value: str) -> int:
     """Supports standard SI suffixes (k, M, G, T) and IEC suffixes
     (Ki, Mi, Gi, Ti). Suffixes are case-sensitive.
