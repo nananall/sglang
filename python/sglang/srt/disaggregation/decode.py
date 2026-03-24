@@ -1041,7 +1041,6 @@ class DecodeTransferQueue:
                     [decode_req.req], decode_req.req.return_logprob
                 )
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                abort_sparse_request(decode_req.req)
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
@@ -1056,7 +1055,6 @@ class DecodeTransferQueue:
                         self.scheduler.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
                         )
-                        abort_sparse_request(decode_req.req)
                         release_kv_cache(
                             decode_req.req, self.tree_cache, is_insert=False
                         )

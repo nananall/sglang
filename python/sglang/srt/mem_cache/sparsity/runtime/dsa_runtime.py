@@ -398,12 +398,26 @@ class DSARuntime:
 
         Returns (bypass_tree_cache, released_prefix_len).  The caller (coordinator)
         must call this BEFORE on_request_end to read the still-valid state.
+
+        Special case: when DSA host-prealloc was used but on_disagg_cache_received
+        was never called (e.g. KV transfer aborted), req_to_token_pool was never
+        written with real GPU KV indices.  Return released_prefix_len = kv_committed_len
+        so that free_committed_and_overallocated_kv skips freeing the all-zero
+        req_to_token_pool entries, avoiding a spurious available_size increase.
         """
         from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
         unwrapped_tree_cache = self._unwrap_tree_cache(tree_cache)
         if req.req_pool_idx is None or not isinstance(unwrapped_tree_cache, ChunkCache):
             return False, None
+
+        # If host-prealloc was used but transfer never completed, no GPU KV was
+        # written to req_to_token_pool, so skip the GPU free entirely.
+        if (
+            getattr(req, "_dsa_prompt_host_indices", None) is not None
+            and not getattr(req, "_dsa_prompt_finalized", False)
+        ):
+            return True, req.kv_committed_len
 
         released_prefix_len = int(self.released_prefix_len[req.req_pool_idx].item())
         return True, released_prefix_len
