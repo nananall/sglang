@@ -47,6 +47,11 @@ def notify_sparse_request_begin(req) -> None:
     _call_coordinator("on_request_begin", req)
 
 
+def abort_sparse_request(req) -> None:
+    """Release sparse/DSA resources for an aborted request (no tree-cache insertion)."""
+    _call_coordinator("on_request_end", req)
+
+
 def finish_sparse_request(req, tree_cache) -> tuple[bool, Optional[int]]:
     """Finalize sparse state for a completed request.
 

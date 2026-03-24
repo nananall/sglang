@@ -3,6 +3,7 @@ from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     RequestTrackers,
     SparseConfig,
     SparseCoordinator,
+    abort_sparse_request,
     clear_sparse_coordinator,
     finish_sparse_request,
     get_disagg_state_indices,
