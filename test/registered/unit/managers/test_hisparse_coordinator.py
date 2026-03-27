@@ -1,6 +1,7 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -35,6 +36,11 @@ class TestHiSparseCoordinator(unittest.TestCase):
         )
         coordinator.lru_slots = torch.zeros((1, 2, 4), dtype=torch.int16)
         coordinator.num_real_reqs = torch.zeros(1, dtype=torch.int32)
+        coordinator.device = "cpu"
+        coordinator.decode_backup_stream = SimpleNamespace(wait_stream=MagicMock())
+        coordinator.decode_producer_stream = None
+        coordinator.pending_decode_backup_event = None
+        coordinator._skip_first_backup = [False, False]
         return coordinator
 
     def test_swap_in_selected_pages_casts_int64_seq_lens_to_int32(self):
@@ -82,3 +88,76 @@ class TestHiSparseCoordinator(unittest.TestCase):
                 top_k_result,
                 layer_id=0,
             )
+
+    def test_wait_pending_decode_backup_waits_and_clears_event(self):
+        coordinator = self._make_coordinator()
+        pending_event = object()
+        coordinator.pending_decode_backup_event = pending_event
+        fake_stream = SimpleNamespace(wait_event=MagicMock())
+
+        with patch(
+            "sglang.srt.managers.hisparse_coordinator.device_module.current_stream",
+            return_value=fake_stream,
+        ):
+            HiSparseCoordinator._wait_pending_decode_backup(coordinator)
+
+        fake_stream.wait_event.assert_called_once_with(pending_event)
+        self.assertIsNone(coordinator.pending_decode_backup_event)
+
+    def test_eager_backup_previous_token_launches_async_backup_on_dedicated_stream(self):
+        coordinator = self._make_coordinator()
+        coordinator.decode_producer_stream = object()
+        coordinator.req_to_device_buffer = torch.tensor([[101, 102, 103, 104, 105]], dtype=torch.int64)
+        coordinator.req_to_host_pool = torch.full((1, 16), -1, dtype=torch.int64)
+        coordinator.mem_pool_host = SimpleNamespace(
+            alloc=MagicMock(return_value=torch.tensor([7], dtype=torch.int64)),
+            backup_from_device_all_layer=MagicMock(),
+        )
+        fake_event = MagicMock()
+        fake_current_stream = object()
+
+        with patch(
+            "sglang.srt.managers.hisparse_coordinator.device_module.stream",
+            return_value=nullcontext(),
+        ), patch(
+            "sglang.srt.managers.hisparse_coordinator.device_module.Event",
+            return_value=fake_event,
+        ), patch(
+            "sglang.srt.managers.hisparse_coordinator.device_module.current_stream",
+            return_value=fake_current_stream,
+        ):
+            HiSparseCoordinator._eager_backup_previous_token(
+                coordinator,
+                seq_lens=torch.tensor([6], dtype=torch.int64),
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([6], dtype=torch.int64),
+                req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
+            )
+
+        self.assertEqual(coordinator.decode_backup_stream.wait_stream.call_count, 2)
+        coordinator.decode_backup_stream.wait_stream.assert_any_call(fake_current_stream)
+        coordinator.decode_backup_stream.wait_stream.assert_any_call(
+            coordinator.decode_producer_stream
+        )
+        coordinator.mem_pool_host.backup_from_device_all_layer.assert_called_once()
+        fake_event.record.assert_called_once()
+        self.assertIs(coordinator.pending_decode_backup_event, fake_event)
+
+    def test_eager_backup_previous_token_skips_tokens_still_in_hot_buffer(self):
+        coordinator = self._make_coordinator()
+        coordinator.mem_pool_host = SimpleNamespace(
+            alloc=MagicMock(),
+            backup_from_device_all_layer=MagicMock(),
+        )
+
+        HiSparseCoordinator._eager_backup_previous_token(
+            coordinator,
+            seq_lens=torch.tensor([5], dtype=torch.int64),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([5], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
+        )
+
+        coordinator.mem_pool_host.alloc.assert_not_called()
+        coordinator.mem_pool_host.backup_from_device_all_layer.assert_not_called()
+        self.assertIsNone(coordinator.pending_decode_backup_event)
