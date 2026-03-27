@@ -561,7 +561,16 @@ class HiSparseCoordinator:
             raise ValueError(
                 f"req_pool_indices dtype {req_pool_indices.dtype} is not int64 as expected"
             )
-        if seq_lens.dtype != torch.int32:
+        if seq_lens.dtype == torch.int64:
+            if seq_lens.numel() > 0 and torch.any(
+                seq_lens > torch.iinfo(torch.int32).max
+            ):
+                raise ValueError(
+                    "seq_lens contains values that exceed the int32 range required by "
+                    f"the HiSparse swap-in kernel: max_seq_len={int(seq_lens.max().item())}"
+                )
+            seq_lens = seq_lens.to(torch.int32)
+        elif seq_lens.dtype != torch.int32:
             raise ValueError(
                 f"seq_lens dtype {seq_lens.dtype} is not int32 as expected"
             )
