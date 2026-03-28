@@ -23,6 +23,13 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["CompressedTensorsMxInt4MoE"]
 
+_FLASHINFER_MXINT4_IMPORT_ERROR: ImportError | None = None
+block_scale_interleave = None
+convert_to_block_layout = None
+trtllm_mxint4_block_scale_moe = None
+_maybe_get_cached_w3_w1_permute_indices = None
+get_w2_permute_indices_with_cache = None
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -33,19 +40,39 @@ if TYPE_CHECKING:
     )
 
 if is_flashinfer_available():
-    from flashinfer.fp4_quantization import block_scale_interleave
-    from flashinfer.fused_moe import (
-        convert_to_block_layout,
-        trtllm_mxint4_block_scale_moe,
-    )
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
+    try:
+        from flashinfer.fp4_quantization import block_scale_interleave
+        from flashinfer.fused_moe import (
+            convert_to_block_layout,
+            trtllm_mxint4_block_scale_moe,
+        )
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+    except ImportError as err:
+        # Older flashinfer builds can be importable while still missing the
+        # Blackwell mxint4 MoE entrypoints. Keep module importable so unrelated
+        # models can still start, and fail lazily only if this scheme is chosen.
+        _FLASHINFER_MXINT4_IMPORT_ERROR = err
+
+
+def _ensure_flashinfer_mxint4_support() -> None:
+    if _FLASHINFER_MXINT4_IMPORT_ERROR is None:
+        return
+
+    raise ImportError(
+        "CompressedTensorsMxInt4MoE requires a flashinfer build that provides "
+        "`flashinfer.fused_moe.trtllm_mxint4_block_scale_moe`. "
+        "Your installed flashinfer appears to be too old or missing mxint4 "
+        "MoE support. Upgrade flashinfer or use a model/backend that does not "
+        "require compressed-tensors mxint4 MoE."
+    ) from _FLASHINFER_MXINT4_IMPORT_ERROR
 
 
 class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
     def __init__(self, quant_config: CompressedTensorsConfig):
+        _ensure_flashinfer_mxint4_support()
         self.quant_config = quant_config
         config = self.quant_config.target_scheme_map["Linear"].get("weights")
         self.num_bits = config.num_bits
