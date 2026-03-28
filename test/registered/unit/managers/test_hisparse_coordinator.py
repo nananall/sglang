@@ -40,7 +40,7 @@ class TestHiSparseCoordinator(unittest.TestCase):
         coordinator.decode_backup_stream = SimpleNamespace(wait_stream=MagicMock())
         coordinator.decode_producer_stream = None
         coordinator.pending_decode_backup_event = None
-        coordinator._skip_first_backup = [False, False]
+        coordinator._skip_first_backup = torch.zeros(2, dtype=torch.bool)
         return coordinator
 
     def test_swap_in_selected_pages_casts_int64_seq_lens_to_int32(self):
@@ -100,6 +100,44 @@ class TestHiSparseCoordinator(unittest.TestCase):
             return_value=fake_stream,
         ):
             HiSparseCoordinator._wait_pending_decode_backup(coordinator)
+
+        fake_stream.wait_event.assert_called_once_with(pending_event)
+        self.assertIsNone(coordinator.pending_decode_backup_event)
+
+    def test_maybe_wait_pending_decode_backup_skips_when_latest_token_not_selected(self):
+        coordinator = self._make_coordinator()
+        pending_event = object()
+        coordinator.pending_decode_backup_event = pending_event
+        fake_stream = SimpleNamespace(wait_event=MagicMock())
+
+        with patch(
+            "sglang.srt.managers.hisparse_coordinator.device_module.current_stream",
+            return_value=fake_stream,
+        ):
+            HiSparseCoordinator._maybe_wait_pending_decode_backup(
+                coordinator,
+                seq_lens=torch.tensor([6], dtype=torch.int32),
+                top_k_result=torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+            )
+
+        fake_stream.wait_event.assert_not_called()
+        self.assertIs(coordinator.pending_decode_backup_event, pending_event)
+
+    def test_maybe_wait_pending_decode_backup_waits_when_latest_token_selected(self):
+        coordinator = self._make_coordinator()
+        pending_event = object()
+        coordinator.pending_decode_backup_event = pending_event
+        fake_stream = SimpleNamespace(wait_event=MagicMock())
+
+        with patch(
+            "sglang.srt.managers.hisparse_coordinator.device_module.current_stream",
+            return_value=fake_stream,
+        ):
+            HiSparseCoordinator._maybe_wait_pending_decode_backup(
+                coordinator,
+                seq_lens=torch.tensor([6], dtype=torch.int32),
+                top_k_result=torch.tensor([[1, 2, 3, 4]], dtype=torch.int32),
+            )
 
         fake_stream.wait_event.assert_called_once_with(pending_event)
         self.assertIsNone(coordinator.pending_decode_backup_event)

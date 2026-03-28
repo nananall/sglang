@@ -119,7 +119,7 @@ class HiSparseCoordinator:
 
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
-        self._skip_first_backup = [False] * max_num_reqs
+        self._skip_first_backup = torch.zeros(max_num_reqs, dtype=torch.bool)
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -310,10 +310,9 @@ class HiSparseCoordinator:
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
     ) -> None:
-        req_pool_indices_cpu = req_pool_indices.cpu()
-
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
@@ -348,23 +347,20 @@ class HiSparseCoordinator:
         """
         # Build the list of batch positions that need a host backup.
         # Skip the first decode step after staging (prefill already backed up).
-        backup_indices = []
-        for i in range(len(seq_lens_cpu)):
-            req_idx = int(req_pool_indices_cpu[i])
-            if self._skip_first_backup[req_idx]:
-                self._skip_first_backup[req_idx] = False
-                continue
-            # While the previous token is still inside the hot device buffer,
-            # attention can read it directly without any host recovery.
-            if int(seq_lens_cpu[i]) - 2 < self.device_buffer_size:
-                continue
-            backup_indices.append(i)
+        skip_mask = self._skip_first_backup[req_pool_indices_cpu]
+        if torch.any(skip_mask):
+            self._skip_first_backup[req_pool_indices_cpu[skip_mask]] = False
 
-        if not backup_indices:
+        # While the previous token is still inside the hot device buffer,
+        # attention can read it directly without any host recovery.
+        long_seq_mask = (seq_lens_cpu - 2) >= self.device_buffer_size
+        backup_mask = (~skip_mask) & long_seq_mask
+
+        if not torch.any(backup_mask):
             return
 
-        backup_indices_gpu = torch.tensor(
-            backup_indices, dtype=torch.int64, device=self.device
+        backup_indices_gpu = torch.nonzero(backup_mask, as_tuple=False).squeeze(1).to(
+            device=self.device, non_blocking=True
         )
         # The previous token's position and its device buffer slot:
         #  - short seq: slot = seq_len - 2  (within the regular buffer)
@@ -571,6 +567,20 @@ class HiSparseCoordinator:
         device_module.current_stream().wait_event(self.pending_decode_backup_event)
         self.pending_decode_backup_event = None
 
+    def _maybe_wait_pending_decode_backup(
+        self, seq_lens: torch.Tensor, top_k_result: torch.Tensor
+    ) -> None:
+        if self.pending_decode_backup_event is None:
+            return
+        if top_k_result.numel() == 0:
+            return
+
+        # The most recently committed token in this decode step lives at seq_len - 2
+        # until it is backed up to host. Only stall when this layer actually selects it.
+        previous_token = seq_lens.unsqueeze(1) - 2
+        if torch.any(top_k_result == previous_token).item():
+            self._wait_pending_decode_backup()
+
     def swap_in_selected_pages(
         self,
         req_pool_indices: torch.Tensor,
@@ -602,7 +612,7 @@ class HiSparseCoordinator:
                 f"top_k_result dtype {top_k_result.dtype} is not int32 as expected"
             )
 
-        self._wait_pending_decode_backup()
+        self._maybe_wait_pending_decode_backup(seq_lens, top_k_result)
 
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
