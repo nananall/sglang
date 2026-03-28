@@ -109,10 +109,12 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (seq_len <= HOT_BUFFER_SIZE) {
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
-    for (int i = tid; i < count; i += BLOCK_SIZE) {
-      int32_t token_pos = req_top_k_tokens[i];
+    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+      int32_t token_pos = (i < count) ? req_top_k_tokens[i] : -1;
       if (token_pos >= 0) {
         req_top_k_device_locs[i] = req_device_buffer_locs[token_pos];
+      } else {
+        req_top_k_device_locs[i] = -1;
       }
     }
     return;
@@ -133,11 +135,13 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   __shared__ int32_t s_total_hits;
   __shared__ int32_t s_newest_hit;
+  __shared__ int32_t s_total_misses;
 
   // Initialize shared memory: counters, hash table, prefix-sum offsets.
   if (tid == 0) {
     s_total_hits = 0;
     s_newest_hit = 0;
+    s_total_misses = 0;
   }
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
@@ -154,7 +158,12 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
-    if (token_idx == newest_token) {
+    if (token_idx < 0) {
+      // Invalid selections produce -1 output directly and do not participate
+      // in hash lookup or miss handling.
+      req_top_k_device_locs[i] = -1;
+      s_top_k_tokens[i] = TOKEN_HIT;
+    } else if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
@@ -315,7 +324,11 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  if (tid == 0) {
+    s_total_misses = s_chunk_offset[NUM_TOKEN_CHUNKS];
+  }
+  __syncthreads();
+  total_misses = s_total_misses;
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];

@@ -89,6 +89,35 @@ class TestHiSparseCoordinator(unittest.TestCase):
                 layer_id=0,
             )
 
+    def test_swap_in_selected_pages_uses_adaptive_block_size(self):
+        coordinator = self._make_coordinator()
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
+        seq_lens = torch.tensor([11, 12], dtype=torch.int32)
+        top_k_result = torch.tensor([[1, 2], [3, -1]], dtype=torch.int32)
+        captured = {}
+
+        def _fake_kernel(**kwargs):
+            captured["block_size"] = kwargs["block_size"]
+            captured["num_top_k"] = kwargs["num_top_k"]
+            captured["top_k_device_locs_shape"] = tuple(kwargs["top_k_device_locs"].shape)
+
+        with patch(
+            "sglang.srt.managers.hisparse_coordinator.load_cache_to_device_buffer_mla",
+            side_effect=_fake_kernel,
+        ):
+            result = HiSparseCoordinator.swap_in_selected_pages(
+                coordinator,
+                req_pool_indices,
+                seq_lens,
+                top_k_result,
+                layer_id=0,
+            )
+
+        self.assertEqual(captured["block_size"], 256)
+        self.assertEqual(captured["num_top_k"], 2)
+        self.assertEqual(captured["top_k_device_locs_shape"], (2, 2))
+        self.assertEqual(tuple(result.shape), (2, 2))
+
     def test_wait_pending_decode_backup_waits_and_clears_event(self):
         coordinator = self._make_coordinator()
         pending_event = object()
@@ -104,7 +133,7 @@ class TestHiSparseCoordinator(unittest.TestCase):
         fake_stream.wait_event.assert_called_once_with(pending_event)
         self.assertIsNone(coordinator.pending_decode_backup_event)
 
-    def test_maybe_wait_pending_decode_backup_skips_when_latest_token_not_selected(self):
+    def test_maybe_wait_pending_decode_backup_waits_once_when_event_present(self):
         coordinator = self._make_coordinator()
         pending_event = object()
         coordinator.pending_decode_backup_event = pending_event
@@ -120,13 +149,11 @@ class TestHiSparseCoordinator(unittest.TestCase):
                 top_k_result=torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
             )
 
-        fake_stream.wait_event.assert_not_called()
-        self.assertIs(coordinator.pending_decode_backup_event, pending_event)
+        fake_stream.wait_event.assert_called_once_with(pending_event)
+        self.assertIsNone(coordinator.pending_decode_backup_event)
 
-    def test_maybe_wait_pending_decode_backup_waits_when_latest_token_selected(self):
+    def test_maybe_wait_pending_decode_backup_skips_when_no_event_is_pending(self):
         coordinator = self._make_coordinator()
-        pending_event = object()
-        coordinator.pending_decode_backup_event = pending_event
         fake_stream = SimpleNamespace(wait_event=MagicMock())
 
         with patch(
@@ -139,7 +166,7 @@ class TestHiSparseCoordinator(unittest.TestCase):
                 top_k_result=torch.tensor([[1, 2, 3, 4]], dtype=torch.int32),
             )
 
-        fake_stream.wait_event.assert_called_once_with(pending_event)
+        fake_stream.wait_event.assert_not_called()
         self.assertIsNone(coordinator.pending_decode_backup_event)
 
     def test_eager_backup_previous_token_launches_async_backup_on_dedicated_stream(self):

@@ -121,6 +121,13 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = torch.zeros(max_num_reqs, dtype=torch.bool)
 
+    def _select_swap_in_block_size(self, effective_top_k: int) -> int:
+        if effective_top_k <= 1024:
+            return 256
+        if effective_top_k <= 2048:
+            return 512
+        return 1024
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
@@ -575,11 +582,10 @@ class HiSparseCoordinator:
         if top_k_result.numel() == 0:
             return
 
-        # The most recently committed token in this decode step lives at seq_len - 2
-        # until it is backed up to host. Only stall when this layer actually selects it.
-        previous_token = seq_lens.unsqueeze(1) - 2
-        if torch.any(top_k_result == previous_token).item():
-            self._wait_pending_decode_backup()
+        # Once a decode-step backup exists, any later layer may need to recover
+        # the previous token from host. Waiting once avoids a per-layer GPU
+        # compare/reduction and the synchronized `.item()` on the hot path.
+        self._wait_pending_decode_backup()
 
     def swap_in_selected_pages(
         self,
@@ -615,10 +621,9 @@ class HiSparseCoordinator:
         self._maybe_wait_pending_decode_backup(seq_lens, top_k_result)
 
         num_reqs = req_pool_indices.size(0)
-        top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
-        top_k_indices.fill_(-1)
-        # todo, adjustable for performance
-        block_size = 1024
+        effective_top_k = top_k_result.shape[1]
+        top_k_indices = self.top_k_device_locs_buffer[:num_reqs, :effective_top_k]
+        block_size = self._select_swap_in_block_size(effective_top_k)
         load_cache_to_device_buffer_mla(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -631,7 +636,7 @@ class HiSparseCoordinator:
             seq_lens=seq_lens,
             lru_slots=self.lru_slots[layer_id],
             item_size_bytes=self.mem_pool_host.token_stride_size,
-            num_top_k=self.top_k,
+            num_top_k=effective_top_k,
             hot_buffer_size=self.device_buffer_size,
             page_size=1,
             block_size=block_size,
