@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.hisparse_coordinator import HiSparseAct, HiSparseCoordinator
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=1, suite="stage-b-test-small-1-gpu")
@@ -17,30 +17,49 @@ class TestHiSparseCoordinator(unittest.TestCase):
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.top_k = 4
         coordinator.device_buffer_size = 4
+        coordinator.padded_buffer_size = 5
         coordinator.top_k_device_locs_buffer = torch.full(
             (2, 4), -1, dtype=torch.int32
         )
-        coordinator.req_device_buffer_tokens = torch.zeros(
-            (1, 2, 4), dtype=torch.int32
+        coordinator.req_device_buffer_tokens = torch.full(
+            (1, 2, 4), -1, dtype=torch.int32
         )
-        coordinator.req_to_host_pool = torch.zeros((2, 16), dtype=torch.int64)
-        coordinator.req_device_buffer_token_locs = torch.zeros(
-            (1, 2, 4), dtype=torch.int32
+        coordinator.req_to_host_pool = torch.full((2, 16), -1, dtype=torch.int64)
+        coordinator.req_device_buffer_token_locs = torch.full(
+            (1, 2, 5), -1, dtype=torch.int32
+        )
+        coordinator.req_to_device_buffer = torch.zeros((2, 5), dtype=torch.int64)
+        coordinator.req_device_buffer_size = torch.zeros(2, dtype=torch.int64)
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.full((2, 16), -1, dtype=torch.int64)
         )
         coordinator.mem_pool_host = SimpleNamespace(
-            kv_buffer=[torch.zeros((1,), dtype=torch.uint8)],
+            kv_buffer=torch.zeros((1, 16, 1, 4), dtype=torch.float32),
             token_stride_size=1,
+            kv_cache_dim=4,
         )
         coordinator.mem_pool_device = SimpleNamespace(
-            kv_buffer=[torch.zeros((1,), dtype=torch.uint8)]
+            kv_buffer=[torch.zeros((1,), dtype=torch.uint8)],
+            page_size=1,
+            layer_num=1,
+            kv_cache_dim=4,
         )
         coordinator.lru_slots = torch.zeros((1, 2, 4), dtype=torch.int16)
+        coordinator._lru_init = torch.zeros(4, dtype=torch.int16)
         coordinator.num_real_reqs = torch.zeros(1, dtype=torch.int32)
         coordinator.device = "cpu"
+        coordinator.write_staging_stream = SimpleNamespace(synchronize=MagicMock())
         coordinator.decode_backup_stream = SimpleNamespace(wait_stream=MagicMock())
         coordinator.decode_producer_stream = None
         coordinator.pending_decode_backup_event = None
         coordinator._skip_first_backup = torch.zeros(2, dtype=torch.bool)
+        coordinator.ack_staging_queue = []
+        coordinator._direct_staging_req_pool_indices = set()
+        coordinator.tp_world_size = 1
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            hisparse_attn_allocator=SimpleNamespace(alloc=MagicMock()),
+            free_hisparse_indices=MagicMock(),
+        )
         return coordinator
 
     def test_swap_in_selected_pages_casts_int64_seq_lens_to_int32(self):
@@ -226,3 +245,78 @@ class TestHiSparseCoordinator(unittest.TestCase):
         coordinator.mem_pool_host.alloc.assert_not_called()
         coordinator.mem_pool_host.backup_from_device_all_layer.assert_not_called()
         self.assertIsNone(coordinator.pending_decode_backup_event)
+
+    def test_collect_ready_reqs_skips_alloc_for_direct_staging(self):
+        coordinator = self._make_coordinator()
+        req = SimpleNamespace(req_pool_idx=1, staging=True)
+        finish_event = MagicMock()
+        finish_event.query.return_value = True
+        coordinator.ack_staging_queue = [
+            HiSparseAct(
+                start_event=MagicMock(),
+                finish_event=finish_event,
+                req=req,
+                needs_alloc_device_buffer=False,
+            )
+        ]
+        coordinator.alloc_device_buffer = MagicMock()
+        coordinator._direct_staging_req_pool_indices.add(req.req_pool_idx)
+
+        ready_reqs = HiSparseCoordinator.collect_ready_reqs(coordinator)
+
+        coordinator.alloc_device_buffer.assert_not_called()
+        self.assertEqual(ready_reqs, [req])
+        self.assertFalse(req.staging)
+        self.assertTrue(coordinator._skip_first_backup[req.req_pool_idx].item())
+        self.assertNotIn(
+            req.req_pool_idx, coordinator._direct_staging_req_pool_indices
+        )
+
+    def test_admit_request_direct_cleans_up_on_preload_failure(self):
+        coordinator = self._make_coordinator()
+        req = SimpleNamespace(req_pool_idx=1, kv_allocated_len=2, rid="req-1", staging=False)
+        coordinator.req_to_token_pool.req_to_token[1, :2] = torch.tensor([3, 4])
+        coordinator.mem_pool_host.alloc = MagicMock(
+            return_value=torch.tensor([7, 8], dtype=torch.int64)
+        )
+        coordinator.mem_pool_host.free = MagicMock()
+        coordinator.mem_pool_host.load_to_device_per_layer = MagicMock(
+            side_effect=RuntimeError("preload failed")
+        )
+        coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc.return_value = (
+            torch.tensor([101, 102], dtype=torch.int64)
+        )
+        source_host_pool = SimpleNamespace(
+            layout="layer_first",
+            page_size=1,
+            kv_cache_dim=4,
+            size=16,
+            kv_buffer=torch.ones((1, 16, 1, 4), dtype=torch.float32),
+        )
+
+        with patch(
+            "sglang.srt.managers.hisparse_coordinator.device_module.Event"
+        ) as event_cls, patch(
+            "sglang.srt.managers.hisparse_coordinator.device_module.stream",
+            return_value=nullcontext(),
+        ):
+            event_cls.side_effect = [MagicMock(), MagicMock()]
+            with self.assertRaisesRegex(RuntimeError, "preload failed"):
+                HiSparseCoordinator.admit_request_direct(
+                    coordinator, req, source_host_pool
+                )
+
+        coordinator.write_staging_stream.synchronize.assert_called_once()
+        coordinator.mem_pool_host.free.assert_called_once()
+        coordinator.token_to_kv_pool_allocator.free_hisparse_indices.assert_called_once()
+        self.assertFalse(req.staging)
+        self.assertEqual(int(coordinator.req_device_buffer_size[req.req_pool_idx]), 0)
+        self.assertTrue(
+            torch.equal(
+                coordinator.req_to_host_pool[req.req_pool_idx, :2],
+                torch.full((2,), -1, dtype=torch.int64),
+            )
+        )
+        self.assertNotIn(
+            req.req_pool_idx, coordinator._direct_staging_req_pool_indices
+        )

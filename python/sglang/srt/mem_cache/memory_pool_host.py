@@ -851,6 +851,25 @@ class MLATokenToKVPoolHost(HostKVCache):
         )
         return buffer
 
+    def get_contiguous_buf_infos(self):
+        if self.layout != "layer_first":
+            raise ValueError(
+                "MLATokenToKVPoolHost.get_contiguous_buf_infos only supports "
+                f"layer_first layout, got {self.layout}"
+            )
+
+        # Match MLATokenToKVPool.get_contiguous_buf_infos: one pointer per layer,
+        # and one transfer item per logical page. The backing storage is token-flat
+        # (`[layer, token, 1, dim]`), so a page transfer lands at token offset
+        # `page_idx * page_size`.
+        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [
+            self.kv_buffer[i][0].nbytes * self.page_size
+            for i in range(self.layer_num)
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):

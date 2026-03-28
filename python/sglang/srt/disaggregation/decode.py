@@ -54,6 +54,8 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseNSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -267,6 +269,19 @@ class DecodePreallocQueue:
         self.pp_rank = pp_rank
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
+        self.hisparse_transfer_host_pool = None
+        if isinstance(self.token_to_kv_pool, HiSparseNSATokenToKVPool):
+            host_to_device_ratio = (
+                self.token_to_kv_pool_allocator.size_full / self.token_to_kv_pool.size
+            )
+            self.hisparse_transfer_host_pool = MLATokenToKVPoolHost(
+                device_pool=self.token_to_kv_pool,
+                host_to_device_ratio=host_to_device_ratio,
+                host_size=0,
+                page_size=self.token_to_kv_pool.page_size,
+                layout="layer_first",
+                override_kv_cache_dim=self.token_to_kv_pool.kv_cache_dim,
+            )
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -293,9 +308,14 @@ class DecodePreallocQueue:
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            self.token_to_kv_pool.get_contiguous_buf_infos()
-        )
+        if self.hisparse_transfer_host_pool is not None:
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                self.hisparse_transfer_host_pool.get_contiguous_buf_infos()
+            )
+        else:
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                self.token_to_kv_pool.get_contiguous_buf_infos()
+            )
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -803,6 +823,19 @@ class DecodePreallocQueue:
         req.kv_committed_len = fill_len
         if self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
+        elif isinstance(self.token_to_kv_pool, HiSparseNSATokenToKVPool):
+            # PD + HiSparse still allocates logical token slots for NSA state
+            # transfer and request bookkeeping, but MLA KV transfer lands in the
+            # decode-side HiSparse host staging pool registered in _init_kv_manager.
+            device = self.token_to_kv_pool_allocator.device
+            kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
+                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                extend_num_tokens=fill_len,
+            )
         else:
             device = self.token_to_kv_pool_allocator.device
             kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
@@ -1195,7 +1228,10 @@ class SchedulerDisaggregationDecodeMixin:
             )  # the requests which kv has arrived
             if self.enable_hisparse:
                 for req in transferred_reqs:
-                    self.hisparse_coordinator.admit_request_into_staging(req)
+                    self.hisparse_coordinator.admit_request_direct(
+                        req,
+                        self.disagg_decode_prealloc_queue.hisparse_transfer_host_pool,
+                    )
                 ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
                 if ready_reqs:
                     self.waiting_queue.extend(ready_reqs)

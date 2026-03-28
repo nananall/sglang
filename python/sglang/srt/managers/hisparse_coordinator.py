@@ -25,6 +25,7 @@ class HiSparseAct(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
     req: Req
+    needs_alloc_device_buffer: bool = True
 
 
 class HiSparseCoordinator:
@@ -80,6 +81,7 @@ class HiSparseCoordinator:
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
         self.ack_staging_queue: List[HiSparseAct] = []
+        self._direct_staging_req_pool_indices = set()
         self.decode_producer_stream = None
         self.pending_decode_backup_event = None
 
@@ -131,6 +133,35 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
+    def _get_device_buffer_alloc_size(self, kv_allocated_len: int) -> int:
+        page_size = self.mem_pool_device.page_size
+        alloc_size = min(
+            ((kv_allocated_len + page_size - 1) // page_size) * page_size,
+            self.device_buffer_size,
+        )
+        if alloc_size == self.device_buffer_size:
+            alloc_size = self.padded_buffer_size
+        return alloc_size
+
+    def _initialize_device_buffer_state(
+        self, req_pool_idx: int, buffer_indices: torch.Tensor, alloc_size: int
+    ) -> None:
+        self.req_to_device_buffer[req_pool_idx, :alloc_size] = buffer_indices
+        self.req_device_buffer_size[req_pool_idx] = alloc_size
+        self.req_device_buffer_tokens[
+            :, req_pool_idx, : self.device_buffer_size
+        ] = torch.arange(self.device_buffer_size, device=self.device)
+        self.req_device_buffer_token_locs[:, req_pool_idx, :alloc_size] = (
+            buffer_indices[:alloc_size]
+        )
+
+    def _reset_device_buffer_state(self, req_pool_idx: int) -> None:
+        self.req_device_buffer_tokens[:, req_pool_idx, :] = -1
+        self.req_device_buffer_token_locs[:, req_pool_idx, :] = -1
+        self.req_to_device_buffer[req_pool_idx, :] = 0
+        self.req_device_buffer_size[req_pool_idx] = 0
+        self.lru_slots[:, req_pool_idx, :].copy_(self._lru_init)
+
     def admit_request_into_staging(self, req: Req) -> None:
         req.staging = True
         logical_indices = self.req_to_token_pool.req_to_token[
@@ -168,21 +199,143 @@ class HiSparseCoordinator:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
 
-        self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
+        self.ack_staging_queue.append(
+            HiSparseAct(start_event, finish_event, req, needs_alloc_device_buffer=True)
+        )
+
+    def admit_request_direct(self, req: Req, source_host_pool: MLATokenToKVPoolHost) -> None:
+        """Prepare a PD-transferred request for HiSparse decode.
+
+        PD transfer writes MLA KV into a decode-side host staging pool whose page
+        layout matches the normal PD protocol.  HiSparse then ingests those
+        transferred tokens into its token-granular host pool and preloads the
+        initial hot prefix into a fresh device buffer.
+        """
+        if source_host_pool is None:
+            raise RuntimeError("HiSparse PD direct admit requires a host transfer pool")
+        if source_host_pool.layout != "layer_first":
+            raise RuntimeError(
+                "HiSparse PD direct admit requires a layer_first host transfer pool"
+            )
+        if source_host_pool.page_size != self.mem_pool_device.page_size:
+            raise RuntimeError(
+                "HiSparse PD transfer pool page size mismatch: "
+                f"{source_host_pool.page_size} != {self.mem_pool_device.page_size}"
+            )
+        if source_host_pool.kv_cache_dim != self.mem_pool_host.kv_cache_dim:
+            raise RuntimeError(
+                "HiSparse PD transfer pool kv_cache_dim mismatch: "
+                f"{source_host_pool.kv_cache_dim} != {self.mem_pool_host.kv_cache_dim}"
+            )
+        req.staging = True
+        req_pool_idx = req.req_pool_idx
+        prefill_len = req.kv_allocated_len
+        logical_indices = self.req_to_token_pool.req_to_token[req_pool_idx, :prefill_len]
+        logical_indices_cpu = logical_indices.cpu()
+        if logical_indices_cpu.numel() > 0:
+            max_logical_index = int(logical_indices_cpu.max().item())
+            if max_logical_index >= source_host_pool.size:
+                raise RuntimeError(
+                    "HiSparse PD transfer pool index out of range: "
+                    f"max logical index {max_logical_index} >= host pool size "
+                    f"{source_host_pool.size}"
+                )
+
+        host_indices_cpu = None
+        host_indices = None
+        buffer_indices = None
+        alloc_size = 0
+        preload_started = False
+        try:
+            host_indices_cpu = self.mem_pool_host.alloc(prefill_len)
+            if host_indices_cpu is None:
+                logger.error(
+                    "HiSparse: host mem pool alloc failed for %d transferred tokens (req %s)",
+                    prefill_len,
+                    req.rid,
+                )
+                raise RuntimeError(
+                    f"HiSparse host mem pool alloc failed for {prefill_len} transferred tokens"
+                )
+            host_indices = host_indices_cpu.to(device=self.device)
+            self.req_to_host_pool[req_pool_idx, :prefill_len] = host_indices
+
+            alloc_size = self._get_device_buffer_alloc_size(req.kv_allocated_len)
+            buffer_indices = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+                alloc_size
+            )
+            if buffer_indices is None:
+                logger.error(
+                    "HiSparse: direct admit device-buffer alloc failed for req %s "
+                    "(kv_allocated_len=%d, alloc_size=%d)",
+                    req.rid,
+                    req.kv_allocated_len,
+                    alloc_size,
+                )
+                raise RuntimeError("HiSparse direct admit device-buffer alloc failed")
+            self._initialize_device_buffer_state(req_pool_idx, buffer_indices, alloc_size)
+            self._direct_staging_req_pool_indices.add(req_pool_idx)
+
+            # PD transfer lands page-wise into a token-flat layer_first buffer.
+            # The original logical token indices therefore remain valid gather
+            # indices for the transferred data.
+            self.mem_pool_host.kv_buffer[:, host_indices_cpu, :, :].copy_(
+                source_host_pool.kv_buffer[:, logical_indices_cpu, :, :]
+            )
+
+            preload_count = min(prefill_len, self.device_buffer_size)
+            preload_host_indices = host_indices[:preload_count]
+            preload_device_indices = buffer_indices[:preload_count]
+
+            start_event = device_module.Event()
+            finish_event = device_module.Event()
+            start_event.record()
+            with device_module.stream(self.write_staging_stream):
+                preload_started = True
+                start_event.wait(self.write_staging_stream)
+                if preload_count > 0:
+                    for layer_id in range(self.mem_pool_device.layer_num):
+                        self.mem_pool_host.load_to_device_per_layer(
+                            self.mem_pool_device,
+                            preload_host_indices,
+                            preload_device_indices,
+                            layer_id,
+                            io_backend="kernel",
+                        )
+                finish_event.record()
+                if host_indices.is_cuda:
+                    host_indices.record_stream(self.write_staging_stream)
+                    preload_host_indices.record_stream(self.write_staging_stream)
+                if buffer_indices.is_cuda:
+                    buffer_indices.record_stream(self.write_staging_stream)
+                    preload_device_indices.record_stream(self.write_staging_stream)
+
+            self.ack_staging_queue.append(
+                HiSparseAct(
+                    start_event,
+                    finish_event,
+                    req,
+                    needs_alloc_device_buffer=False,
+                )
+            )
+        except Exception:
+            if preload_started:
+                self.write_staging_stream.synchronize()
+            if buffer_indices is not None:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(buffer_indices)
+                self._reset_device_buffer_state(req_pool_idx)
+            if host_indices_cpu is not None:
+                self.mem_pool_host.free(host_indices_cpu)
+            self.req_to_host_pool[req_pool_idx, :] = -1
+            self._direct_staging_req_pool_indices.discard(req_pool_idx)
+            req.staging = False
+            raise
 
     def alloc_device_buffer(self, req: Req) -> None:
         allocated_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_allocated_len
         ]
-        page_size = self.mem_pool_device.page_size
-        # Allocate only enough for current tokens (page-aligned).
-        # When prefill already fills device_buffer_size, include the reserved page.
-        alloc_size = min(
-            ((req.kv_allocated_len + page_size - 1) // page_size) * page_size,
-            self.device_buffer_size,
-        )
-        if alloc_size == self.device_buffer_size:
-            alloc_size = self.padded_buffer_size
+        alloc_size = self._get_device_buffer_alloc_size(req.kv_allocated_len)
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
             allocated_indices,
             alloc_size,
@@ -197,15 +350,7 @@ class HiSparseCoordinator:
             )
             raise RuntimeError("HiSparse alloc_device_buffer returned None")
 
-        self.req_to_device_buffer[req.req_pool_idx, :alloc_size] = buffer_indices
-        self.req_device_buffer_size[req.req_pool_idx] = alloc_size
-
-        self.req_device_buffer_tokens[
-            :, req.req_pool_idx, : self.device_buffer_size
-        ] = torch.arange(self.device_buffer_size, device=self.device)
-        self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
-            buffer_indices[:alloc_size]
-        )
+        self._initialize_device_buffer_state(req.req_pool_idx, buffer_indices, alloc_size)
 
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
@@ -216,8 +361,8 @@ class HiSparseCoordinator:
             return ready_reqs
 
         finish_count = 0
-        for _, finish_event, _ in self.ack_staging_queue:
-            if not finish_event.query():
+        for act in self.ack_staging_queue:
+            if not act.finish_event.query():
                 break
             finish_count += 1
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
@@ -230,9 +375,12 @@ class HiSparseCoordinator:
             )
         finish_count = int(queue_size.item())
         while finish_count > 0:
-            _, _, req = self.ack_staging_queue.pop(0)
-            # prepare device buffer and update req
-            self.alloc_device_buffer(req)
+            act = self.ack_staging_queue.pop(0)
+            req = act.req
+            if act.needs_alloc_device_buffer:
+                self.alloc_device_buffer(req)
+            else:
+                self._direct_staging_req_pool_indices.discard(req.req_pool_idx)
             req.staging = False
             self._skip_first_backup[req.req_pool_idx] = True
             finish_count -= 1
@@ -526,6 +674,15 @@ class HiSparseCoordinator:
         host_indices = host_indices[host_indices >= 0]
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
+        if req.req_pool_idx in self._direct_staging_req_pool_indices:
+            current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
+            if current_cap > 0:
+                buffer_indices = self.req_to_device_buffer[
+                    req.req_pool_idx, :current_cap
+                ]
+                self.token_to_kv_pool_allocator.free_hisparse_indices(buffer_indices)
+            self._reset_device_buffer_state(req.req_pool_idx)
+            self._direct_staging_req_pool_indices.discard(req.req_pool_idx)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
         req.staging = False
@@ -560,13 +717,10 @@ class HiSparseCoordinator:
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
         # clear req info
-        self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
-        self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
-        self.req_to_device_buffer[req.req_pool_idx, :] = 0
-        self.req_device_buffer_size[req.req_pool_idx] = 0
+        self._reset_device_buffer_state(req.req_pool_idx)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._direct_staging_req_pool_indices.discard(req.req_pool_idx)
 
     def _wait_pending_decode_backup(self) -> None:
         if self.pending_decode_backup_event is None:

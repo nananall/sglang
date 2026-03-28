@@ -265,6 +265,40 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         return logical_indices
 
+    def alloc_logical_only(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        """Allocate only the logical NSA slots.
+
+        This is used by PD decode + HiSparse. KV transfer still lands in the
+        decode-side logical device pool, and HiSparse ingests that data into its
+        own host/device buffers after transfer completes.
+        """
+        assert self.page_size > 1
+        num_tokens = extend_num_tokens + len(seq_lens) * self.page_size
+
+        if num_tokens > self.logical_attn_allocator.available_size():
+            return None
+
+        logical_indices = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        assert (
+            logical_indices is not None
+        ), "Logical allocation failed in alloc_logical_only"
+        return logical_indices
+
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
