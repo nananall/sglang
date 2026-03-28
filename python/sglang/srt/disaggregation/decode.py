@@ -1167,6 +1167,11 @@ class SchedulerDisaggregationDecodeMixin:
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
+        if self.enable_hisparse:
+            ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+            if ready_reqs:
+                self.waiting_queue.extend(ready_reqs)
+
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
@@ -1188,4 +1193,11 @@ class SchedulerDisaggregationDecodeMixin:
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
-            self.waiting_queue.extend(transferred_reqs)
+            if self.enable_hisparse:
+                for req in transferred_reqs:
+                    self.hisparse_coordinator.admit_request_into_staging(req)
+                ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+                if ready_reqs:
+                    self.waiting_queue.extend(ready_reqs)
+            else:
+                self.waiting_queue.extend(transferred_reqs)
