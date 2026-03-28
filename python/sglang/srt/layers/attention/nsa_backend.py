@@ -36,7 +36,9 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -70,6 +72,7 @@ global_workspace_buffer = None
 # Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
 _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
+_HISPARSE_DECODE_TOPK_TRIM_GRANULARITY = 256
 
 
 @dataclass(frozen=True)
@@ -1520,6 +1523,10 @@ class NativeSparseAttnBackend(
         # Align topk_indices with q dimensions
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+            if forward_batch.hisparse_coordinator is not None:
+                topk_indices = self._trim_hisparse_decode_topk_suffix(
+                    topk_indices, forward_batch
+                )
 
         if forward_batch.hisparse_coordinator is not None:
             page_table_1 = forward_batch.hisparse_coordinator.swap_in_selected_pages(
@@ -1571,15 +1578,18 @@ class NativeSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif self.nsa_decode_impl == "fa3":
+            runtime_cache_seqlens, runtime_cu_seqlens_k = (
+                self._get_runtime_decode_nsa_k_metadata(metadata, page_table_1)
+            )
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
                 v_head_dim=layer.v_head_dim,
                 q_nope=q_nope,
                 page_table=page_table_1,
-                cache_seqlens=metadata.nsa_cache_seqlens_int32,
+                cache_seqlens=runtime_cache_seqlens,
                 cu_seqlens_q=metadata.nsa_cu_seqlens_q,
-                cu_seqlens_k=metadata.nsa_cu_seqlens_k,
+                cu_seqlens_k=runtime_cu_seqlens_k,
                 max_seqlen_q=metadata.nsa_max_seqlen_q,
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
@@ -2040,6 +2050,58 @@ class NativeSparseAttnBackend(
             device=topk_indices.device,
         )
         return torch.cat([topk_indices, padding], dim=0)
+
+    def _trim_hisparse_decode_topk_suffix(
+        self,
+        topk_indices: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Drop the shared trailing all-invalid suffix before HiSparse swap-in.
+
+        Keep this conservative:
+        - only apply on HiSparse decode
+        - skip fixed-width decode backends
+        - skip when CUDA graph is enabled to preserve fixed replay shapes
+        - bucket the effective width so we only JIT a small set of NUM_TOP_K variants
+        """
+        if (
+            forward_batch.hisparse_coordinator is None
+            or topk_indices.numel() == 0
+            or topk_indices.shape[1] <= 1
+            or self.nsa_decode_impl in {"flashmla_kv", "trtllm"}
+        ):
+            return topk_indices
+
+        server_args = get_global_server_args()
+        if not server_args.disable_cuda_graph or not server_args.disable_piecewise_cuda_graph:
+            return topk_indices
+
+        valid_cols = torch.any(topk_indices >= 0, dim=0)
+        if not torch.any(valid_cols):
+            return topk_indices[:, :1].contiguous()
+
+        effective_topk = int(torch.nonzero(valid_cols, as_tuple=False)[-1].item()) + 1
+        bucketed_topk = min(
+            topk_indices.shape[1],
+            ceil_align(effective_topk, _HISPARSE_DECODE_TOPK_TRIM_GRANULARITY),
+        )
+        if bucketed_topk == topk_indices.shape[1]:
+            return topk_indices
+        return topk_indices[:, :bucketed_topk].contiguous()
+
+    def _get_runtime_decode_nsa_k_metadata(
+        self,
+        metadata: NSAMetadata,
+        page_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Align decode K metadata with the runtime page-table width."""
+        runtime_topk = page_table.shape[1]
+        cache_seqlens = metadata.nsa_cache_seqlens_int32
+        if runtime_topk >= self.nsa_index_topk:
+            return cache_seqlens, metadata.nsa_cu_seqlens_k
+
+        clipped_cache_seqlens = cache_seqlens.clamp(max=runtime_topk)
+        return clipped_cache_seqlens, compute_cu_seqlens(clipped_cache_seqlens)
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
