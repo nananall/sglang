@@ -731,6 +731,10 @@ class SchedulerDisaggregationPrefillMixin:
         )
         req.start_send_idx = end_idx
         state_indices = None
+        # PD preallocation on the decode side only reserves prompt-length KV/state slots.
+        # The first generated token after prefill is recomputed locally by the decode worker,
+        # so the last-chunk state transfer must stay aligned with the prompt-bounded KV range.
+        transfer_seq_len = end_idx
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
@@ -748,7 +752,7 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
             elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
                 # SWA hybrid model: send last window KV indices
-                seq_len = len(req.fill_ids)
+                seq_len = transfer_seq_len
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
@@ -768,7 +772,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
             ):
-                seq_len = len(req.fill_ids)
+                seq_len = transfer_seq_len
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
