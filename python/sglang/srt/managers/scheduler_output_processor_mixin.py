@@ -80,6 +80,17 @@ class SchedulerOutputProcessorMixin:
             return details
         return None
 
+    def _release_disagg_decode_req(
+        self: Scheduler, req: Req, is_insert: bool = True
+    ) -> None:
+        """Release decode-side KV state, including HiSparse direct-admit buffers."""
+        if self.enable_hisparse:
+            if req.staging:
+                self.hisparse_coordinator.abort_staging_request(req)
+            else:
+                self.hisparse_coordinator.request_finished(req)
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
@@ -87,7 +98,7 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                release_kv_cache(req, self.tree_cache)
+                self._release_disagg_decode_req(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.stream_output(batch.reqs, batch.return_logprob)
@@ -450,9 +461,7 @@ class SchedulerOutputProcessorMixin:
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         self.decode_offload_manager.finalize_release_on_finish(req)
                 else:
-                    if self.enable_hisparse:
-                        self.hisparse_coordinator.request_finished(req)
-                    release_kv_cache(req, self.tree_cache)
+                    self._release_disagg_decode_req(req)
 
                 req.time_stats.set_completion_time()
 

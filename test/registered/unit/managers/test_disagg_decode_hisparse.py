@@ -10,6 +10,9 @@ from sglang.srt.disaggregation.decode import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseNSATokenToKVPool
+from sglang.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
 )
@@ -179,3 +182,83 @@ class TestDisaggDecodeHiSparse(unittest.TestCase):
         scheduler.check_memory.assert_not_called()
         scheduler.check_tree_cache.assert_not_called()
         scheduler.maybe_sleep_on_idle.assert_not_called()
+
+    def test_release_disagg_decode_req_uses_hisparse_request_finished(self):
+        req = SimpleNamespace(staging=False)
+        hisparse = SimpleNamespace(
+            request_finished=MagicMock(),
+            abort_staging_request=MagicMock(),
+        )
+        scheduler = SimpleNamespace(
+            enable_hisparse=True,
+            hisparse_coordinator=hisparse,
+            tree_cache=object(),
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler_output_processor_mixin.release_kv_cache"
+        ) as mock_release:
+            SchedulerOutputProcessorMixin._release_disagg_decode_req(scheduler, req)
+
+        hisparse.request_finished.assert_called_once_with(req)
+        hisparse.abort_staging_request.assert_not_called()
+        mock_release.assert_called_once_with(req, scheduler.tree_cache, is_insert=True)
+
+    def test_release_disagg_decode_req_aborts_hisparse_staging_req(self):
+        req = SimpleNamespace(staging=True)
+        hisparse = SimpleNamespace(
+            request_finished=MagicMock(),
+            abort_staging_request=MagicMock(),
+        )
+        scheduler = SimpleNamespace(
+            enable_hisparse=True,
+            hisparse_coordinator=hisparse,
+            tree_cache=object(),
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler_output_processor_mixin.release_kv_cache"
+        ) as mock_release:
+            SchedulerOutputProcessorMixin._release_disagg_decode_req(scheduler, req)
+
+        hisparse.abort_staging_request.assert_called_once_with(req)
+        hisparse.request_finished.assert_not_called()
+        mock_release.assert_called_once_with(req, scheduler.tree_cache, is_insert=True)
+
+    def test_process_batch_result_prebuilt_releases_hisparse_state(self):
+        req = SimpleNamespace(
+            staging=False,
+            time_stats=SimpleNamespace(
+                set_decode_prebuilt_finish_time=MagicMock(),
+                set_quick_finish_time=MagicMock(),
+            ),
+            check_finished=MagicMock(),
+            finished=MagicMock(return_value=True),
+        )
+        hisparse = SimpleNamespace(
+            request_finished=MagicMock(),
+            abort_staging_request=MagicMock(),
+        )
+        scheduler = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.DECODE,
+            enable_hisparse=True,
+            hisparse_coordinator=hisparse,
+            tree_cache=object(),
+            stream_output=MagicMock(),
+        )
+        batch = SimpleNamespace(reqs=[req], return_logprob=False)
+
+        with patch(
+            "sglang.srt.managers.scheduler_output_processor_mixin.release_kv_cache"
+        ) as mock_release:
+            SchedulerOutputProcessorMixin.process_batch_result_prebuilt(
+                scheduler, batch
+            )
+
+        req.time_stats.set_decode_prebuilt_finish_time.assert_called_once_with()
+        req.check_finished.assert_called_once_with()
+        req.time_stats.set_quick_finish_time.assert_called_once_with()
+        hisparse.request_finished.assert_called_once_with(req)
+        hisparse.abort_staging_request.assert_not_called()
+        mock_release.assert_called_once_with(req, scheduler.tree_cache, is_insert=True)
+        scheduler.stream_output.assert_called_once_with(batch.reqs, batch.return_logprob)
