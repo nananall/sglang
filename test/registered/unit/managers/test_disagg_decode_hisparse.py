@@ -8,6 +8,9 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+    ScheduleBatchDisaggregationDecodeMixin,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseNSATokenToKVPool
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -19,6 +22,45 @@ from sglang.srt.managers.scheduler_runtime_checker_mixin import (
 
 
 class TestDisaggDecodeHiSparse(unittest.TestCase):
+    def test_prepare_for_prebuilt_populates_req_pool_indices_cpu(self):
+        req = SimpleNamespace(
+            req_pool_idx=7,
+            fill_ids=[101, 102, 103, 104],
+            prefix_indices=[11, 12, 13],
+            extend_input_len=1,
+            origin_input_ids=[101, 102, 103, 104],
+            output_ids=[999],
+            retracted_stain=False,
+            cached_tokens=0,
+            already_computed=0,
+            is_retracted=False,
+            extend_logprob_start_len=0,
+            multimodal_inputs=None,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            device="cpu",
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.tensor([[555]], dtype=torch.int64)
+            ),
+            return_logprob=False,
+            model_config=SimpleNamespace(vocab_size=32000),
+            tree_cache=object(),
+            spec_algorithm=SimpleNamespace(
+                is_eagle=MagicMock(return_value=False),
+            ),
+            enable_overlap=False,
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode_schedule_batch_mixin.SamplingBatchInfo.from_schedule_batch",
+            return_value=MagicMock(),
+        ):
+            ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
+
+        self.assertTrue(torch.equal(batch.req_pool_indices, torch.tensor([7])))
+        self.assertTrue(torch.equal(batch.req_pool_indices_cpu, torch.tensor([7])))
+
     def test_get_new_prebuilt_batch_attaches_hisparse_coordinator(self):
         req = SimpleNamespace(init_next_round_input=MagicMock())
         new_batch = SimpleNamespace(
