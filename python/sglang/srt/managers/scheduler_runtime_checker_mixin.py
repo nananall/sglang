@@ -361,7 +361,7 @@ class SchedulerRuntimeCheckerMixin:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
             queue_size = (
                 len(self.waiting_queue)
                 + len(self.disagg_decode_transfer_queue.queue)
@@ -371,9 +371,8 @@ class SchedulerRuntimeCheckerMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
             if queue_size:
                 return
-        elif self.enable_hisparse:
-            if self.hisparse_coordinator.has_ongoing_staging():
-                return
+        if self.enable_hisparse and self.hisparse_coordinator.has_ongoing_staging():
+            return
 
         self.check_memory()
         self.check_tree_cache()

@@ -8,7 +8,11 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseNSATokenToKVPool
+from sglang.srt.managers.scheduler_runtime_checker_mixin import (
+    SchedulerRuntimeCheckerMixin,
+)
 
 
 class TestDisaggDecodeHiSparse(unittest.TestCase):
@@ -148,3 +152,30 @@ class TestDisaggDecodeHiSparse(unittest.TestCase):
         self.assertEqual(captured["args"].kv_data_lens, [22])
         self.assertEqual(captured["args"].kv_item_lens, [33])
         self.assertEqual(captured["args"].page_size, 64)
+
+    def test_idle_self_check_skips_while_hisparse_staging_is_ongoing(self):
+        scheduler = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.DECODE,
+            waiting_queue=[],
+            disagg_decode_transfer_queue=SimpleNamespace(queue=[]),
+            disagg_decode_prealloc_queue=SimpleNamespace(queue=[]),
+            server_args=SimpleNamespace(
+                disaggregation_decode_enable_offload_kvcache=False
+            ),
+            enable_hisparse=True,
+            hisparse_coordinator=SimpleNamespace(
+                has_ongoing_staging=MagicMock(return_value=True)
+            ),
+            check_memory=MagicMock(),
+            check_tree_cache=MagicMock(),
+            maybe_sleep_on_idle=MagicMock(),
+            new_token_ratio=None,
+            init_new_token_ratio=0.42,
+        )
+
+        SchedulerRuntimeCheckerMixin.self_check_during_idle(scheduler)
+
+        scheduler.hisparse_coordinator.has_ongoing_staging.assert_called_once_with()
+        scheduler.check_memory.assert_not_called()
+        scheduler.check_tree_cache.assert_not_called()
+        scheduler.maybe_sleep_on_idle.assert_not_called()
