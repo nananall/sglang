@@ -871,13 +871,34 @@ class MooncakeKVManager(CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices is not None:
-                                self.maybe_send_extra(
+                                ret = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     target_rank_registration_info.dst_state_data_ptrs,
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                if ret != 0:
+                                    with self.session_lock:
+                                        self.session_failures[req.mooncake_session_id] += 1
+                                        if self.session_failures[req.mooncake_session_id] >= 1:
+                                            self.failed_sessions.add(req.mooncake_session_id)
+                                            logger.error(
+                                                f"Session {req.mooncake_session_id} failed during state transfer."
+                                            )
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Failed to send state chunk of {kv_chunk.room} to {req.endpoint}:{req.dst_port}",
+                                    )
+                                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint,
+                                        req.dst_port,
+                                        req.room,
+                                        KVPoll.Failed,
+                                        prefill_unique_rank,
+                                    )
+                                    break
 
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(

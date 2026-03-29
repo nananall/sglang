@@ -245,6 +245,7 @@ class HiSparseCoordinator:
         host_indices = None
         buffer_indices = None
         alloc_size = 0
+        preload_count = 0
         preload_started = False
         try:
             host_indices_cpu = self.mem_pool_host.alloc(prefill_len)
@@ -284,6 +285,14 @@ class HiSparseCoordinator:
             )
 
             preload_count = min(prefill_len, self.device_buffer_size)
+            if preload_count > 0:
+                # Direct-admit keeps prompt KV in the coordinator-managed device buffer
+                # instead of the logical KV pool. Rebinding resident prompt tokens to
+                # their current HiSparse slots preserves any decode-side logical access
+                # that still goes through translate_loc_to_hisparse_device().
+                self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                    logical_indices[:preload_count]
+                ] = buffer_indices[:preload_count]
             preload_host_indices = host_indices[:preload_count]
             preload_device_indices = buffer_indices[:preload_count]
 
@@ -321,6 +330,10 @@ class HiSparseCoordinator:
         except Exception:
             if preload_started:
                 self.write_staging_stream.synchronize()
+            if preload_count > 0:
+                self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                    logical_indices[:preload_count]
+                ] = 0
             if buffer_indices is not None:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(buffer_indices)
                 self._reset_device_buffer_state(req_pool_idx)
@@ -675,6 +688,12 @@ class HiSparseCoordinator:
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
         if req.req_pool_idx in self._direct_staging_req_pool_indices:
+            allocated_locs = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : req.kv_allocated_len
+            ]
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                allocated_locs
+            ] = 0
             current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
             if current_cap > 0:
                 buffer_indices = self.req_to_device_buffer[
