@@ -8,7 +8,6 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoProcessor,
-    AutoTokenizer,
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
@@ -59,8 +58,13 @@ def get_tokenizer(
         pretrained_model_name_or_path
     ):
         pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
-    return AutoTokenizer.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=True
+    # Reuse SGLang's tokenizer loader so benchmarks get the same custom-config
+    # and trust-remote-code handling as the serving stack.
+    from sglang.srt.utils.hf_transformers_utils import get_tokenizer as get_hf_tokenizer
+
+    return get_hf_tokenizer(
+        pretrained_model_name_or_path,
+        trust_remote_code=True,
     )
 
 

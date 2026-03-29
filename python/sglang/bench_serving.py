@@ -34,7 +34,7 @@ import aiohttp
 import numpy as np
 import requests
 from tqdm.asyncio import tqdm
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
@@ -1637,8 +1637,11 @@ async def benchmark(
 
 def check_chat_template(model_path):
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        return "chat_template" in tokenizer.init_kwargs
+        tokenizer = get_tokenizer(model_path)
+        init_kwargs = getattr(tokenizer, "init_kwargs", {})
+        return ("chat_template" in init_kwargs) or (
+            getattr(tokenizer, "chat_template", None) is not None
+        )
     except Exception as e:
         print(f"Fail to load tokenizer config with error={e}")
         return False
