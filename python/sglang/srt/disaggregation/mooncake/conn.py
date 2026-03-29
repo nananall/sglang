@@ -59,8 +59,6 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
-    # layer_id >= 0: layer-wise transfer for a single layer; -1: full transfer (all layers)
-    layer_id: int = -1
 
 
 # decode
@@ -371,88 +369,6 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
-        )
-
-    def send_kvcache_single_layer(
-        self,
-        mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int32],
-        dst_kv_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int32],
-        layer_id: int,
-    ) -> int:
-        """Transfer KV cache for a single attention layer (MHA only).
-        Used by layer-wise transfer to overlap RDMA with GPU forward computation.
-
-        layer_id is the global attention layer index. The local index within this
-        PP stage is computed by subtracting prefill_start_layer.
-        """
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-        )
-        start_layer = self.kv_args.prefill_start_layer
-        local_layer_id = layer_id - start_layer
-        if local_layer_id < 0 or local_layer_id >= layers_current_pp_stage:
-            # This layer does not belong to this PP stage; skip silently.
-            return 0
-
-        item_lens = self.kv_args.kv_item_lens
-        k_item_len = item_lens[local_layer_id]
-        v_item_len = item_lens[layers_current_pp_stage + local_layer_id]
-
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_kv_indices, dst_kv_indices
-        )
-
-        def build_transfer_blocks(src_ptr, dst_ptr, item_len):
-            transfer_blocks = []
-            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                transfer_blocks.append((src_addr, dst_addr, length))
-            return transfer_blocks
-
-        transfer_blocks = build_transfer_blocks(
-            src_k_ptrs[local_layer_id], dst_k_ptrs[local_layer_id], k_item_len
-        ) + build_transfer_blocks(
-            src_v_ptrs[local_layer_id], dst_v_ptrs[local_layer_id], v_item_len
-        )
-        return self._transfer_data(mooncake_session_id, transfer_blocks)
-
-    def add_layerwise_transfer_request(
-        self,
-        bootstrap_room: int,
-        kv_indices: npt.NDArray[np.int32],
-        index_slice: slice,
-        layer_id: int,
-    ):
-        """Queue a single-layer KV transfer chunk (layer_id >= 0)."""
-        assert self.disaggregation_mode == DisaggregationMode.PREFILL
-
-        if (
-            bootstrap_room not in self.request_status
-            or self.check_status(bootstrap_room) == KVPoll.Failed
-        ):
-            return
-
-        if bootstrap_room not in self.transfer_infos:
-            return
-
-        dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
-        shard_idx = session_port_sum % len(self.transfer_queues)
-
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=False,
-                prefill_aux_index=None,
-                state_indices=None,
-                layer_id=layer_id,
-            )
         )
 
     def send_kvcache_slice(
@@ -910,25 +826,10 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         _transfer_profile = envs.SGLANG_MOONCAKE_TRANSFER_PROFILE.get()
                         _transfer_t0 = time.perf_counter() if _transfer_profile else None
-                        _tp_homogeneous = self.is_mla_backend or (
+                        if self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
-                        )
-                        if kv_chunk.layer_id == -2:
-                            # Layer-wise mode last chunk: KV already transferred per-layer;
-                            # skip KV transfer here, only send aux data below.
-                            ret = 0
-                        elif kv_chunk.layer_id >= 0:
-                            # Layer-wise transfer: only send a single layer's KV
-                            # (only supported for TP-homogeneous + MHA, not MLA or TP-mismatch)
-                            ret = self.send_kvcache_single_layer(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                kv_chunk.layer_id,
-                            )
-                        elif _tp_homogeneous:
+                        ):
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -1174,7 +1075,6 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
-        skip_kv_data: bool = False,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -1201,8 +1101,6 @@ class MooncakeKVManager(CommonKVManager):
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
 
-        # layer_id=-2 signals "skip KV data, send aux+notify only" (layer-wise last chunk)
-        layer_id = -2 if skip_kv_data else -1
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -1211,7 +1109,6 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
-                layer_id=layer_id,
             )
         )
 
@@ -1264,39 +1161,11 @@ class MooncakeKVSender(CommonKVSender):
         self.conclude_state = None
         self.init_time = time.time()
 
-    def send_layer(
-        self,
-        layer_id: int,
-        kv_indices: npt.NDArray[np.int32],
-    ):
-        """Queue a single-layer KV transfer (used by layer-wise disagg prefill).
-
-        Unlike send(), this does NOT advance curr_idx or set is_last_chunk.
-        It only queues the transfer for a specific layer. The caller must still
-        call send() at the end to finalize the transfer (send aux data + notify).
-        """
-        if self.kv_mgr.is_dummy_cp_rank:
-            return
-
-        index_slice = slice(0, len(kv_indices))
-        self.kv_mgr.add_layerwise_transfer_request(
-            self.bootstrap_room,
-            kv_indices,
-            index_slice,
-            layer_id,
-        )
-
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
-        skip_kv_data: bool = False,
     ):
-        """Send KV data chunk.
-
-        When skip_kv_data=True (layer-wise mode), skip the actual KV data transfer
-        and only send the is_last_chunk signal with aux data.
-        """
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
@@ -1316,37 +1185,21 @@ class MooncakeKVSender(CommonKVSender):
                 return
 
         if not is_last_chunk:
-            if not skip_kv_data:
-                self.kv_mgr.add_transfer_request(
-                    self.bootstrap_room,
-                    kv_indices,
-                    index_slice,
-                    False,
-                )
-            # If skip_kv_data=True for a non-last chunk, nothing to do — KV was
-            # already transferred layer-by-layer via send_layer().
+            self.kv_mgr.add_transfer_request(
+                self.bootstrap_room,
+                kv_indices,
+                index_slice,
+                False,
+            )
         else:
-            if skip_kv_data:
-                # Layer-wise mode: KV data was already transferred; only send
-                # the completion signal (aux data + notify decode).
-                self.kv_mgr.add_transfer_request(
-                    self.bootstrap_room,
-                    kv_indices,
-                    index_slice,
-                    True,
-                    aux_index=self.aux_index,
-                    state_indices=state_indices,
-                    skip_kv_data=True,
-                )
-            else:
-                self.kv_mgr.add_transfer_request(
-                    self.bootstrap_room,
-                    kv_indices,
-                    index_slice,
-                    True,
-                    aux_index=self.aux_index,
-                    state_indices=state_indices,
-                )
+            self.kv_mgr.add_transfer_request(
+                self.bootstrap_room,
+                kv_indices,
+                index_slice,
+                True,
+                aux_index=self.aux_index,
+                state_indices=state_indices,
+            )
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:

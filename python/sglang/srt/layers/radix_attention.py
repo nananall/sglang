@@ -170,9 +170,4 @@ def unified_attention_with_output(
     ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
 
     output.view(ret.shape).copy_(ret)
-
-    # Layer-wise KV transfer: trigger per-layer RDMA transfer after attention
-    if context.disagg_layerwise_fn is not None:
-        context.disagg_layerwise_fn(layer_id)
-
     return
