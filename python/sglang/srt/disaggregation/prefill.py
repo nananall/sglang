@@ -26,6 +26,9 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+import numpy as np
+
+from sglang.srt.compilation.piecewise_context_manager import register_disagg_layerwise_fn
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
@@ -60,6 +63,56 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_register_layerwise_fn(scheduler: "Scheduler", batch: "ScheduleBatch") -> None:
+    """If SGLANG_MOONCAKE_LAYERWISE_TRANSFER is set and the batch is a disagg prefill
+    extend batch, register a per-layer KV transfer callback on the ForwardContext
+    (via register_disagg_layerwise_fn) so that each attention layer's KV is transferred
+    immediately after it is computed, overlapping RDMA with the GPU forward pass.
+
+    Only active when:
+      - SGLANG_MOONCAKE_LAYERWISE_TRANSFER env var is True
+      - batch is extend mode (not decode)
+      - All requests have a MooncakeKVSender with send_layer() support (MHA only)
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_MOONCAKE_LAYERWISE_TRANSFER.get():
+        return
+    if not batch.forward_mode.is_extend():
+        return
+
+    page_size = scheduler.token_to_kv_pool_allocator.page_size
+    req_to_token_pool = scheduler.req_to_token_pool
+
+    # Pre-compute page_indices for each non-chunked req
+    # (KV slots are allocated before forward, so this is safe to do now)
+    req_page_indices = []
+    for req in batch.reqs:
+        if req.is_chunked > 0:
+            req_page_indices.append(None)
+            continue
+        if not hasattr(req, "disagg_kv_sender") or not hasattr(
+            req.disagg_kv_sender, "send_layer"
+        ):
+            # Not a MooncakeKVSender; skip layerwise for this batch
+            return
+        num_tokens = len(req.origin_input_ids)
+        kv_indices = (
+            req_to_token_pool.req_to_token[req.req_pool_idx, 0:num_tokens].cpu().numpy()
+        )
+        page_indices = kv_to_page_indices(kv_indices, page_size)
+        req_page_indices.append((req, page_indices))
+
+    def layerwise_fn(layer_id: int) -> None:
+        for item in req_page_indices:
+            if item is None:
+                continue
+            req, page_indices = item
+            req.disagg_kv_sender.send_layer(layer_id, page_indices)
+
+    register_disagg_layerwise_fn(layerwise_fn)
 
 
 def release_req_to_metadata_buffer(
@@ -371,6 +424,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                _maybe_register_layerwise_fn(self, batch)
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -399,6 +453,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                _maybe_register_layerwise_fn(self, batch)
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
@@ -781,4 +836,15 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
-        req.disagg_kv_sender.send(page_indices, state_indices)
+
+        # In layer-wise transfer mode, KV data was already transferred per-layer
+        # during the forward pass.  The final send() only needs to deliver the
+        # completion signal (aux data + notify decode).
+        from sglang.srt.environ import envs as _envs
+
+        _skip_kv = (
+            last_chunk
+            and _envs.SGLANG_MOONCAKE_LAYERWISE_TRANSFER.get()
+            and hasattr(req.disagg_kv_sender, "send_layer")
+        )
+        req.disagg_kv_sender.send(page_indices, state_indices, skip_kv_data=_skip_kv)
