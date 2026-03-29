@@ -284,6 +284,7 @@ class Envs:
     SGLANG_HICACHE_MAX_PINNED_RATIO = EnvFloat(0.0)
 
     # Mooncake KV Transfer
+    SGLANG_MOONCAKE_TRANSFER_PROFILE = EnvBool(False)
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)

@@ -824,6 +824,8 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        _transfer_profile = envs.SGLANG_MOONCAKE_TRANSFER_PROFILE.get()
+                        _transfer_t0 = time.perf_counter() if _transfer_profile else None
                         if self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
@@ -845,6 +847,25 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
+                            )
+                        if _transfer_profile:
+                            _transfer_ms = (time.perf_counter() - _transfer_t0) * 1000
+                            _num_pages = len(kv_chunk.prefill_kv_indices)
+                            _page_size = self.kv_args.page_size
+                            _num_tokens = _num_pages * _page_size
+                            _kv_bytes = sum(self.kv_args.kv_item_lens) * _num_pages
+                            _bw_gb_s = (_kv_bytes / 1e9) / (_transfer_ms / 1000) if _transfer_ms > 0 else 0
+                            _tp_homogeneous = self.is_mla_backend or (
+                                self.attn_tp_size == target_rank_registration_info.dst_attn_tp_size
+                            )
+                            logger.info(
+                                f"[KV-Transfer-Profile] room={kv_chunk.room} "
+                                f"num_tokens={_num_tokens} num_pages={_num_pages} "
+                                f"kv_bytes={_kv_bytes/1e6:.1f}MB "
+                                f"transfer_ms={_transfer_ms:.2f} "
+                                f"bandwidth={_bw_gb_s:.2f}GB/s "
+                                f"tp_homogeneous={_tp_homogeneous} "
+                                f"is_last_chunk={kv_chunk.is_last_chunk}"
                             )
                         if ret != 0:
                             with self.session_lock:

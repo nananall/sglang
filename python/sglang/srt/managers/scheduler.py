@@ -2612,6 +2612,20 @@ class Scheduler(
                 # TODO(lsyin): delete this branch after unifying the abstraction.
                 worker_batch_or_batch = batch
 
+            # KV transfer profiling: measure GPU forward time for disagg prefill extend batches
+            _kv_profile = (
+                envs.SGLANG_MOONCAKE_TRANSFER_PROFILE.get()
+                and getattr(self, "disaggregation_mode", None) is not None
+                and self.disaggregation_mode == DisaggregationMode.PREFILL
+                and batch.forward_mode.is_extend()
+            )
+            _forward_event_start = None
+            _forward_event_end = None
+            if _kv_profile:
+                _forward_event_start = torch.cuda.Event(enable_timing=True)
+                _forward_event_end = torch.cuda.Event(enable_timing=True)
+                _forward_event_start.record()
+
             if self.enable_overlap:
                 model_worker_batch = worker_batch_or_batch
                 self.record_batch_in_overlap(model_worker_batch)
@@ -2673,6 +2687,18 @@ class Scheduler(
                     )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
+
+            if _kv_profile:
+                _forward_event_end.record()
+                torch.cuda.synchronize()
+                _forward_ms = _forward_event_start.elapsed_time(_forward_event_end)
+                _num_tokens = int(batch.seq_lens_sum) if hasattr(batch, "seq_lens_sum") else -1
+                _batch_size = len(batch.reqs)
+                logger.info(
+                    f"[KV-Forward-Profile] batch_size={_batch_size} "
+                    f"num_tokens={_num_tokens} "
+                    f"forward_ms={_forward_ms:.2f}"
+                )
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
