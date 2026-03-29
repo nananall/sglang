@@ -84,12 +84,6 @@ def _maybe_register_layerwise_fn(scheduler: "Scheduler", batch: "ScheduleBatch")
         return
 
     page_size = scheduler.token_to_kv_pool_allocator.page_size
-    # With page_size=1, each layer would require one tiny RDMA op per page (token),
-    # making the per-layer CPU scheduling overhead dominate. Only enable layerwise
-    # when page_size is large enough that the RDMA overlap benefit exceeds the overhead.
-    _MIN_PAGE_SIZE_FOR_LAYERWISE = 16
-    if page_size < _MIN_PAGE_SIZE_FOR_LAYERWISE:
-        return
     req_to_token_pool = scheduler.req_to_token_pool
 
     # Pre-compute page_indices for each non-chunked req
