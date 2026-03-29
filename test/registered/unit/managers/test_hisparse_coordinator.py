@@ -377,3 +377,50 @@ class TestHiSparseCoordinator(unittest.TestCase):
             102,
         )
         self.assertEqual(len(coordinator.ack_staging_queue), 1)
+
+    def test_admit_request_direct_copies_transferred_prompt_into_host_pool(self):
+        coordinator = self._make_coordinator()
+        req = SimpleNamespace(
+            req_pool_idx=1,
+            kv_allocated_len=2,
+            rid="req-1",
+            staging=False,
+        )
+        coordinator.req_to_token_pool.req_to_token[1, :2] = torch.tensor([3, 4])
+        coordinator.mem_pool_host.alloc = MagicMock(
+            return_value=torch.tensor([7, 8], dtype=torch.int64)
+        )
+        coordinator.mem_pool_host.load_to_device_per_layer = MagicMock()
+        coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc.return_value = (
+            torch.tensor([101, 102], dtype=torch.int64)
+        )
+        source_host_pool = SimpleNamespace(
+            layout="layer_first",
+            page_size=1,
+            kv_cache_dim=4,
+            size=16,
+            kv_buffer=torch.zeros((1, 16, 1, 4), dtype=torch.float32),
+        )
+        source_host_pool.kv_buffer[0, 3, 0] = torch.tensor([3.0, 30.0, 300.0, 3000.0])
+        source_host_pool.kv_buffer[0, 4, 0] = torch.tensor([4.0, 40.0, 400.0, 4000.0])
+
+        with patch(
+            "sglang.srt.managers.hisparse_coordinator.device_module.Event"
+        ) as event_cls, patch(
+            "sglang.srt.managers.hisparse_coordinator.device_module.stream",
+            return_value=nullcontext(),
+        ):
+            start_event = MagicMock()
+            finish_event = MagicMock()
+            event_cls.side_effect = [start_event, finish_event]
+
+            HiSparseCoordinator.admit_request_direct(coordinator, req, source_host_pool)
+
+        torch.testing.assert_close(
+            coordinator.mem_pool_host.kv_buffer[0, 7, 0],
+            torch.tensor([3.0, 30.0, 300.0, 3000.0]),
+        )
+        torch.testing.assert_close(
+            coordinator.mem_pool_host.kv_buffer[0, 8, 0],
+            torch.tensor([4.0, 40.0, 400.0, 4000.0]),
+        )

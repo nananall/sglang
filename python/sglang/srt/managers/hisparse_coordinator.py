@@ -278,10 +278,14 @@ class HiSparseCoordinator:
             self._direct_staging_req_pool_indices.add(req_pool_idx)
 
             # PD transfer lands page-wise into a token-flat layer_first buffer.
-            # The original logical token indices therefore remain valid gather
-            # indices for the transferred data.
-            self.mem_pool_host.kv_buffer[:, host_indices_cpu, :, :].copy_(
-                source_host_pool.kv_buffer[:, logical_indices_cpu, :, :]
+            # Use index_select/index_copy_ here: advanced-index result tensors are
+            # not writable views, so `dst[:, idx].copy_(...)` would only mutate a
+            # temporary and silently leave the real host pool untouched.
+            transferred_prompt = source_host_pool.kv_buffer.index_select(
+                1, logical_indices_cpu
+            )
+            self.mem_pool_host.kv_buffer.index_copy_(
+                1, host_indices_cpu, transferred_prompt
             )
 
             preload_count = min(prefill_len, self.device_buffer_size)
