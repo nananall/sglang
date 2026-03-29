@@ -19,6 +19,83 @@ from sglang.srt.managers.scheduler_runtime_checker_mixin import (
 
 
 class TestDisaggDecodeHiSparse(unittest.TestCase):
+    def test_get_new_prebuilt_batch_attaches_hisparse_coordinator(self):
+        req = SimpleNamespace(init_next_round_input=MagicMock())
+        new_batch = SimpleNamespace(
+            prepare_for_prebuilt=MagicMock(),
+            process_prebuilt=MagicMock(),
+            hisparse_coordinator=None,
+        )
+        hisparse = object()
+        scheduler = SimpleNamespace(
+            grammar_manager=SimpleNamespace(
+                has_waiting_grammars=MagicMock(return_value=False)
+            ),
+            waiting_queue=[req],
+            running_batch=SimpleNamespace(batch_size=MagicMock(return_value=0)),
+            req_to_token_pool=SimpleNamespace(size=8),
+            max_running_requests=8,
+            tree_cache=object(),
+            model_config=object(),
+            enable_overlap=False,
+            spec_algorithm=object(),
+            enable_hisparse=True,
+            hisparse_coordinator=hisparse,
+            server_args=object(),
+            future_map=object(),
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+            return_value=new_batch,
+        ):
+            ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(scheduler)
+
+        req.init_next_round_input.assert_called_once_with(scheduler.tree_cache)
+        self.assertIs(ret, new_batch)
+        self.assertIs(new_batch.hisparse_coordinator, hisparse)
+        new_batch.prepare_for_prebuilt.assert_called_once_with()
+        new_batch.process_prebuilt.assert_called_once_with(
+            scheduler.server_args, scheduler.future_map
+        )
+
+    def test_get_next_disagg_decode_batch_to_run_preserves_hisparse_coordinator(self):
+        hisparse = object()
+        new_prebuilt_batch = SimpleNamespace(
+            filter_batch=MagicMock(),
+            is_empty=MagicMock(return_value=False),
+            hisparse_coordinator=None,
+        )
+        running_batch = SimpleNamespace(
+            is_empty=MagicMock(return_value=False),
+            merge_batch=MagicMock(),
+            hisparse_coordinator=None,
+        )
+        scheduler = SimpleNamespace(
+            get_new_prebuilt_batch=MagicMock(return_value=new_prebuilt_batch),
+            chunked_req=None,
+            process_batch_result_prebuilt=MagicMock(),
+            running_batch=running_batch,
+            enable_hisparse=True,
+            hisparse_coordinator=hisparse,
+            update_running_batch=MagicMock(return_value=running_batch),
+            maybe_prepare_mlp_sync_batch=MagicMock(side_effect=lambda batch: batch),
+        )
+
+        with patch("sglang.srt.disaggregation.decode.set_schedule_time_batch"):
+            ret = (
+                SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
+                    scheduler
+                )
+            )
+
+        scheduler.process_batch_result_prebuilt.assert_called_once_with(
+            new_prebuilt_batch
+        )
+        running_batch.merge_batch.assert_called_once_with(new_prebuilt_batch)
+        self.assertIs(running_batch.hisparse_coordinator, hisparse)
+        self.assertIs(ret, running_batch)
+
     def test_process_decode_queue_direct_admits_transferred_reqs_for_hisparse(self):
         transferred_req = SimpleNamespace(rid="req-1")
         ready_req = SimpleNamespace(rid="req-ready")

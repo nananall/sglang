@@ -1131,6 +1131,8 @@ class SchedulerDisaggregationDecodeMixin:
                     self.running_batch = new_prebuilt_batch
                 else:
                     self.running_batch.merge_batch(new_prebuilt_batch)
+                if self.enable_hisparse:
+                    self.running_batch.hisparse_coordinator = self.hisparse_coordinator
 
         # Schedule decode batch
         if self.running_batch.is_empty():
@@ -1189,6 +1191,11 @@ class SchedulerDisaggregationDecodeMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
+        if self.enable_hisparse:
+            # HiSparse decode batches must carry the coordinator so the first
+            # real decode step can remap out_cache_loc into the per-request
+            # device buffer rather than writing into logical slot 0.
+            new_batch.hisparse_coordinator = self.hisparse_coordinator
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
