@@ -394,6 +394,14 @@ class HiSparseCoordinator:
                 self.alloc_device_buffer(req)
             else:
                 self._direct_staging_req_pool_indices.discard(req.req_pool_idx)
+            # The staging preload ran on write_staging_stream.  The CPU-side
+            # finish_event.query() check only proves the GPU completed that work
+            # on the staging stream; it does NOT create any ordering on the main
+            # compute stream.  Without an explicit wait, the decode kernel that
+            # reads kv_buffer on the main stream races with the staging writes.
+            # Enqueue a GPU-side barrier so all subsequent main-stream ops see
+            # the staged data.
+            device_module.current_stream().wait_event(act.finish_event)
             req.staging = False
             self._skip_first_backup[req.req_pool_idx] = True
             finish_count -= 1
