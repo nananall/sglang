@@ -1537,7 +1537,19 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
 
-        if self.nsa_decode_impl == "flashmla_sparse":
+        # HiSparse swap_in_selected_pages returns absolute token-level device slot indices
+        # (one entry per top-k selection).  flashmla_kv reshapes kv_cache to 64-token pages
+        # and treats those indices as page numbers, reading the wrong 64-token block each time.
+        # flashmla_sparse accesses kv_cache as a flat 2D buffer using direct slot indices,
+        # which is the only correct path for the HiSparse token-granular device buffer.
+        effective_decode_impl = self.nsa_decode_impl
+        if (
+            forward_batch.hisparse_coordinator is not None
+            and effective_decode_impl == "flashmla_kv"
+        ):
+            effective_decode_impl = "flashmla_sparse"
+
+        if effective_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
@@ -1547,7 +1559,7 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif self.nsa_decode_impl == "flashmla_kv":
+        elif effective_decode_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
