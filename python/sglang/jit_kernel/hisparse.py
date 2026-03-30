@@ -11,6 +11,31 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
+_PTX_STATIC_SMEM_LIMIT_BYTES = 48 * 1024
+
+
+def _hash_size(num_top_k: int, hot_buffer_size: int) -> int:
+    if hot_buffer_size >= 8192 and num_top_k >= 2048:
+        return (num_top_k * 3) // 2
+    return num_top_k * 2
+
+
+def _estimate_static_shared_mem_bytes(num_top_k: int, hot_buffer_size: int) -> int:
+    num_buffer_chunks = (hot_buffer_size + 31) // 32
+    hash_size = _hash_size(num_top_k, hot_buffer_size)
+    total = 0
+    total += 4 * num_top_k  # s_top_k_tokens
+    total += 2 * (num_buffer_chunks + 1)  # s_chunk_offset
+    total += 2 * (num_buffer_chunks + 1)  # s_evict_chunk_offset
+    total += 2 * hot_buffer_size  # s_lru_slots_out
+    total += 4 * hash_size  # s_hash_keys
+    total += 2 * hash_size  # s_hash_vals
+    total += 12  # s_total_hits / s_newest_hit / s_total_misses
+    # Conservatively round up to the next 16-byte boundary to reflect ptxas
+    # alignment of static shared allocations.
+    return ((total + 15) // 16) * 16
+
+
 @functools.cache
 def _jit_sparse_module(
     item_size_bytes: int,
@@ -57,6 +82,15 @@ def load_cache_to_device_buffer_mla(
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    estimated_smem = _estimate_static_shared_mem_bytes(num_top_k, hot_buffer_size)
+    if estimated_smem > _PTX_STATIC_SMEM_LIMIT_BYTES:
+        raise ValueError(
+            "HiSparse kernel configuration exceeds nvcc's static shared-memory "
+            f"limit: top_k={num_top_k}, hot_buffer_size={hot_buffer_size}, "
+            f"estimated_static_smem={estimated_smem} bytes > "
+            f"{_PTX_STATIC_SMEM_LIMIT_BYTES}. "
+            "Reduce device_buffer_size/top_k or update the kernel layout."
+        )
 
     module = _jit_sparse_module(
         item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla=True

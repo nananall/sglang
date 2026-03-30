@@ -36,9 +36,11 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
   }
 }
 
-__device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int accumulator) {
+template <typename T>
+__device__ __forceinline__ int
+warp_inclusive_scan(T* s_data, int lane_id, int offset, int count, int accumulator) {
   int idx = lane_id + offset;
-  int val = (idx < count) ? s_data[idx] : 0;
+  int val = (idx < count) ? static_cast<int>(s_data[idx]) : 0;
 
 #pragma unroll
   for (int i = 1; i < 32; i *= 2) {
@@ -47,7 +49,7 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
   }
   val += accumulator;
   if (idx < count) {
-    s_data[idx] = val;
+    s_data[idx] = static_cast<T>(val);
   }
   accumulator = __shfl_sync(0xffffffff, val, 31);
   return accumulator;
@@ -83,6 +85,8 @@ __global__ void load_cache_to_device_buffer_kernel(
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
   constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
+  using offset_t = uint16_t;
+  static_assert(HOT_BUFFER_SIZE <= 65535, "HOT_BUFFER_SIZE exceeds offset_t range");
 
   const int bid = blockIdx.x;
   // Early exit for padded blocks (CUDA graph pads batch to a captured size)
@@ -123,13 +127,18 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Top-k token positions; reused as miss-token scratch in the copy phase
   __shared__ int32_t s_top_k_tokens[NUM_TOP_K];
   // Prefix-sum offsets for hit counting and miss counting
-  __shared__ int32_t s_chunk_offset[NUM_BUFFER_CHUNKS + 1];
+  __shared__ offset_t s_chunk_offset[NUM_BUFFER_CHUNKS + 1];
   // Prefix-sum offsets for evictable counting
-  __shared__ int32_t s_evict_chunk_offset[NUM_BUFFER_CHUNKS + 1];
+  __shared__ offset_t s_evict_chunk_offset[NUM_BUFFER_CHUNKS + 1];
   // Compacted slot ordering: [hits fwd→  ...  ←evictables bwd]
   __shared__ int16_t s_lru_slots_out[HOT_BUFFER_SIZE];
   // Open-addressing hash table: top-k token_id → top-k index
-  constexpr int HASH_SIZE = NUM_TOP_K * 2;
+  // Large hot buffers can exceed nvcc's 48 KiB static shared-memory limit on
+  // Hopper when we keep the hash table at 2x top-k.  A 1.5x table still keeps
+  // load factor <= 2/3 for the current 2048-top-k use case while letting
+  // 8192-hot-buffer kernels compile.
+  constexpr int HASH_SIZE =
+      (HOT_BUFFER_SIZE >= 8192 && NUM_TOP_K >= 2048) ? (NUM_TOP_K * 3 / 2) : (NUM_TOP_K * 2);
   __shared__ int32_t s_hash_keys[HASH_SIZE];
   __shared__ int16_t s_hash_vals[HASH_SIZE];
 
