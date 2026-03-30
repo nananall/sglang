@@ -681,9 +681,9 @@ class HiSparseCoordinator:
         but has not yet completed (i.e. req.staging is True).
         """
         # Remove from staging queue
-        self.ack_staging_queue = [
+        self.ack_staging_queue = deque(
             act for act in self.ack_staging_queue if act.req is not req
-        ]
+        )
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
