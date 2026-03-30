@@ -1533,7 +1533,7 @@ class NativeSparseAttnBackend(
         if forward_batch.hisparse_coordinator is not None:
             page_table_1 = forward_batch.hisparse_coordinator.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
+                forward_batch.seq_lens.to(torch.int32),
                 topk_indices,
                 layer.layer_id,
             )
