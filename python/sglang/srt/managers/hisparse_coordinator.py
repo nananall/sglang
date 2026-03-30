@@ -5,18 +5,22 @@ from typing import List, NamedTuple
 
 import torch
 
+from sglang.jit_kernel.fused_store_index_cache import (
+    can_use_nsa_fused_store,
+    fused_store_index_k_cache,
+)
+from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_cuda
 
 device_module = get_device_module()
-
-from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+_is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +177,17 @@ class HiSparseCoordinator:
           which tells the swap-in kernel that those tokens are cached in the device
           buffer.  In the staging path this is correct (prefill filled the buffer),
           but here the buffer is empty.
+
+        Index-K fixup:
+        - In the staging path, forward_extend runs on this node and writes
+          index_k_with_scale_buffer as part of normal prefill.  In the
+          direct-to-host path the decode node never runs prefill, so
+          index_k_with_scale_buffer stays all-zeros.  NSA indexer then
+          computes garbage top-k logits which may reference uninitialized
+          host-pool slots, causing CUDA illegal memory access.
+        - Fix: after RDMA data lands in host pool, extract the index-key
+          dimension (first 128 dims) from each token, upload to GPU, and
+          write into index_k_with_scale_buffer at the logical slot positions.
         """
         self.alloc_device_buffer(req)
 
@@ -189,9 +204,85 @@ class HiSparseCoordinator:
                 :, req.req_pool_idx, : self.device_buffer_size
             ] = -1
 
+        # Populate index_k_with_scale_buffer from host KV data so that the
+        # NSA indexer can select accurate top-k tokens on the first decode step.
+        self._fill_index_k_from_host(req)
+
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
+
+    def _fill_index_k_from_host(self, req: Req) -> None:
+        """Populate index_k_with_scale_buffer from prefill KV stored in host pool.
+
+        In the PD direct-to-host path, the decode node never runs forward_extend,
+        so index_k_with_scale_buffer is never written.  Without this fixup the
+        NSA indexer would see all-zero logits and choose arbitrary top-k tokens,
+        potentially referencing uninitialized host-pool entries and triggering
+        CUDA illegal memory access.
+
+        We read the first index_head_dim (128) bf16 values per token from the
+        host pool (pinned CPU memory), copy them to GPU, and call
+        fused_store_index_k_cache to quantize + write into the logical pages of
+        index_k_with_scale_buffer.
+
+        The fused kernel expects:
+          key:            (N, 128) bf16  CUDA
+          index_k_with_scale: (num_pages, 64*132) uint8  CUDA
+          out_cache_loc:  (N,) int64  CUDA   ← logical indices
+        """
+        if not _is_cuda:
+            return
+
+        n = req.kv_allocated_len
+        index_head_dim = self.mem_pool_device.index_head_dim  # == 128
+        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]  # (n,) int64 GPU
+
+        # Logical slot indices for this request (written by _pre_alloc)
+        out_cache_loc = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :n
+        ].to(torch.int64)  # (n,) int64 GPU
+
+        # Check fused-store availability once (not per layer).
+        if not can_use_nsa_fused_store(
+            torch.bfloat16, out_cache_loc.dtype, self.mem_pool_device.page_size
+        ):
+            # fused kernel unavailable (non-CUDA or fnuz fp8); skip silently.
+            # NSA indexer will fall back to all-zero logits as before.
+            return
+
+        # Pull host indices to CPU once; reuse for every layer.
+        host_indices_cpu = host_indices.cpu()
+
+        for layer_id in range(
+            self.mem_pool_device.start_layer,
+            self.mem_pool_device.start_layer + self.mem_pool_device.layer_num,
+        ):
+            buf = self.mem_pool_device.get_index_k_with_scale_buffer(layer_id)
+
+            # host_kv_buf layout (layer_first): (host_size, 1, kv_cache_dim) bf16 CPU
+            host_layer_idx = layer_id - self.mem_pool_device.start_layer
+            host_kv_buf = self.mem_pool_host.kv_buffer[host_layer_idx]
+
+            # Gather key slice for this request: (n, 128) CPU bf16
+            key_host = host_kv_buf[host_indices_cpu, 0, :index_head_dim]
+
+            # Upload to GPU (non-blocking H2D copy from pinned memory)
+            key_gpu = key_host.to(device=self.device, non_blocking=True)  # (n, 128) GPU bf16
+
+            fused_store_index_k_cache(
+                key_gpu,
+                buf,
+                out_cache_loc,
+                self.mem_pool_device.page_size,
+            )
+
+        logger.debug(
+            "HiSparse: filled index_k_with_scale_buffer for req %s (%d tokens, %d layers)",
+            req.rid,
+            n,
+            self.mem_pool_device.layer_num,
+        )
 
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
