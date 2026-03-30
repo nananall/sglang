@@ -87,6 +87,15 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
+                # codeflicker-fix: LOGIC-Issue-memory-leak/oeflvo4v1rwwfcu1cvoj
+                # Must call request_finished before release_kv_cache so that
+                # hisparse_attn_allocator device buffer slots are freed.
+                # release_kv_cache -> free() only frees logical indices; it cannot
+                # free hisparse device buffer slots because
+                # full_to_hisparse_device_index_mapping was never populated in the
+                # direct-to-host path.
+                if self.enable_hisparse:
+                    self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
