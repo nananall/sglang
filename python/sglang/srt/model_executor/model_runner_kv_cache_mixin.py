@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import (
+    get_nsa_index_head_dim,
+    get_nsa_index_topk,
+    is_deepseek_nsa,
+)
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
@@ -69,6 +73,22 @@ _is_npu = is_npu()
 
 
 class ModelRunnerKVCacheMixin:
+    def get_validated_hisparse_config(self: ModelRunner):
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        hisparse_cfg = parse_hisparse_config(self.server_args)
+        if self.use_mla_backend and is_deepseek_nsa(self.model_config.hf_config):
+            nsa_index_topk = get_nsa_index_topk(self.model_config.hf_config)
+            if hisparse_cfg.top_k < nsa_index_topk:
+                raise ValueError(
+                    "HiSparse top_k "
+                    f"({hisparse_cfg.top_k}) must be no smaller than the model NSA "
+                    f"index_topk ({nsa_index_topk}). Smaller values are not supported "
+                    "because the model indexer still produces that many top-k entries "
+                    "per token."
+                )
+        return hisparse_cfg
+
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
@@ -500,9 +520,7 @@ class ModelRunnerKVCacheMixin:
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
             )
             if self.enable_hisparse:
-                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-                hisparse_cfg = parse_hisparse_config(self.server_args)
+                hisparse_cfg = self.get_validated_hisparse_config()
                 nsa_pool_kwargs["host_to_device_ratio"] = (
                     hisparse_cfg.host_to_device_ratio
                 )
@@ -684,11 +702,7 @@ class ModelRunnerKVCacheMixin:
                     )
                 else:
                     if self.enable_hisparse:
-                        from sglang.srt.mem_cache.sparsity import (
-                            parse_hisparse_config,
-                        )
-
-                        hisparse_cfg = parse_hisparse_config(self.server_args)
+                        hisparse_cfg = self.get_validated_hisparse_config()
                         self.token_to_kv_pool_allocator = (
                             HiSparseTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,

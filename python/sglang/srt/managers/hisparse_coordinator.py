@@ -807,6 +807,14 @@ class HiSparseCoordinator:
 
         num_reqs = req_pool_indices.size(0)
         effective_top_k = top_k_result.shape[1]
+        available_top_k = self.top_k_device_locs_buffer.shape[1]
+        if effective_top_k > available_top_k:
+            raise ValueError(
+                "HiSparse swap-in received more top-k entries than the coordinator "
+                f"buffer can hold: effective_top_k={effective_top_k}, "
+                f"buffer_top_k={available_top_k}. Ensure hisparse_config top_k is "
+                "no smaller than the model's NSA index_topk."
+            )
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs, :effective_top_k]
         block_size = self._select_swap_in_block_size(effective_top_k)
         load_cache_to_device_buffer_mla(

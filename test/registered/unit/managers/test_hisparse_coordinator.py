@@ -140,6 +140,21 @@ class TestHiSparseCoordinator(unittest.TestCase):
         self.assertEqual(captured["top_k_device_locs_shape"], (2, 2))
         self.assertEqual(tuple(result.shape), (2, 2))
 
+    def test_swap_in_selected_pages_rejects_more_topk_than_buffer_supports(self):
+        coordinator = self._make_coordinator()
+        req_pool_indices = torch.tensor([0], dtype=torch.int64)
+        seq_lens = torch.tensor([11], dtype=torch.int32)
+        top_k_result = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int32)
+
+        with self.assertRaisesRegex(ValueError, "buffer can hold"):
+            HiSparseCoordinator.swap_in_selected_pages(
+                coordinator,
+                req_pool_indices,
+                seq_lens,
+                top_k_result,
+                layer_id=0,
+            )
+
     def test_wait_pending_decode_backup_waits_and_clears_event(self):
         coordinator = self._make_coordinator()
         pending_event = object()
