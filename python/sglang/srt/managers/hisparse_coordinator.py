@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+from collections import deque
 from typing import List, NamedTuple
 
 import torch
@@ -80,7 +81,7 @@ class HiSparseCoordinator:
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
-        self.ack_staging_queue: List[HiSparseAct] = []
+        self.ack_staging_queue: deque[HiSparseAct] = deque()
         self._direct_staging_req_pool_indices = set()
         self.decode_producer_stream = None
         self.pending_decode_backup_event = None
@@ -231,16 +232,8 @@ class HiSparseCoordinator:
         req_pool_idx = req.req_pool_idx
         prefill_len = req.kv_allocated_len
         logical_indices = self.req_to_token_pool.req_to_token[req_pool_idx, :prefill_len]
-        logical_indices_cpu = logical_indices.cpu()
-        if logical_indices_cpu.numel() > 0:
-            max_logical_index = int(logical_indices_cpu.max().item())
-            if max_logical_index >= source_host_pool.size:
-                raise RuntimeError(
-                    "HiSparse PD transfer pool index out of range: "
-                    f"max logical index {max_logical_index} >= host pool size "
-                    f"{source_host_pool.size}"
-                )
 
+        logical_indices_cpu = logical_indices.cpu()
         host_indices_cpu = None
         host_indices = None
         buffer_indices = None
@@ -392,7 +385,7 @@ class HiSparseCoordinator:
             )
         finish_count = int(queue_size.item())
         while finish_count > 0:
-            act = self.ack_staging_queue.pop(0)
+            act = self.ack_staging_queue.popleft()
             req = act.req
             if act.needs_alloc_device_buffer:
                 self.alloc_device_buffer(req)
