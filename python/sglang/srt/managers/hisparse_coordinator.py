@@ -544,9 +544,12 @@ class HiSparseCoordinator:
         but has not yet completed (i.e. req.staging is True).
         """
         # Remove from staging queue
-        self.ack_staging_queue = [
+        # codeflicker-fix: LOGIC-Issue-002/oeflvo4v1rwwfcu1cvoj
+        # Wrap in deque() to preserve the queue type; a plain list comprehension
+        # would replace the deque and break any popleft() callers.
+        self.ack_staging_queue = deque(
             act for act in self.ack_staging_queue if act.req is not req
-        ]
+        )
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
@@ -558,6 +561,19 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
         req.staging = False
+
+    def release_host_pool_for_req(self, req: Req) -> None:
+        """Release only the host pool allocation made during _pre_alloc (direct path).
+
+        Used when a transfer fails before admit_request_direct is called, so
+        alloc_device_buffer has NOT run yet and device buffer state is untouched.
+        codeflicker-fix: LOGIC-Issue-003/oeflvo4v1rwwfcu1cvoj
+        """
+        host_indices = self.req_to_host_pool[req.req_pool_idx, : req.kv_allocated_len]
+        host_indices = host_indices[host_indices >= 0]
+        if host_indices.numel() > 0:
+            self.mem_pool_host.free(host_indices)
+        self.req_to_host_pool[req.req_pool_idx, :] = -1
 
     def retract_req(self, req: Req) -> None:
         if req.staging:

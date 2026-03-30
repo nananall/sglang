@@ -824,6 +824,7 @@ class DecodePreallocQueue:
         req.kv_committed_len = fill_len
 
         if self.scheduler.enable_hisparse:
+            # codeflicker-fix: LOGIC-Issue-001/oeflvo4v1rwwfcu1cvoj
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
@@ -835,6 +836,14 @@ class DecodePreallocQueue:
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
                 extend_num_tokens=fill_len,
+            )
+            assert (
+                kv_loc is not None
+            ), "KV cache is full! There is a bug in memory estimation."
+            # Write logical indices into req_to_token_pool so that alloc_device_buffer
+            # and request_finished can correctly read the allocated slot indices.
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(0, len(kv_loc))), kv_loc
             )
             # Allocate host indices for the RDMA transfer target
             host_indices = coordinator.mem_pool_host.alloc(fill_len)
@@ -858,11 +867,13 @@ class DecodePreallocQueue:
                 extend_num_tokens=fill_len,
             )
 
-        assert (
-            kv_loc is not None
-        ), "KV cache is full! There is a bug in memory estimation."
-
-        self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
+        if not self.scheduler.enable_hisparse:
+            assert (
+                kv_loc is not None
+            ), "KV cache is full! There is a bug in memory estimation."
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(0, len(kv_loc))), kv_loc
+            )
 
         # populate metadata
         req.fill_ids = req.origin_input_ids + req.output_ids
@@ -1012,7 +1023,14 @@ class DecodeTransferQueue:
                     [decode_req.req], decode_req.req.return_logprob
                 )
                 if self.scheduler.enable_hisparse:
-                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+                    # codeflicker-fix: LOGIC-Issue-003/oeflvo4v1rwwfcu1cvoj
+                    # Transfer failed before admit_request_direct was called, so
+                    # alloc_device_buffer never ran. Only release the host pool
+                    # allocation made in _pre_alloc; do NOT call request_finished
+                    # which would try to free uninitialized device buffer state.
+                    self.scheduler.hisparse_coordinator.release_host_pool_for_req(
+                        decode_req.req
+                    )
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
@@ -1029,7 +1047,10 @@ class DecodeTransferQueue:
                             [decode_req.req], decode_req.req.return_logprob
                         )
                         if self.scheduler.enable_hisparse:
-                            self.scheduler.hisparse_coordinator.request_finished(
+                            # codeflicker-fix: LOGIC-Issue-003/oeflvo4v1rwwfcu1cvoj
+                            # Corruption abort: same as Failed — admit_request_direct
+                            # never ran, so only release host pool allocation.
+                            self.scheduler.hisparse_coordinator.release_host_pool_for_req(
                                 decode_req.req
                             )
                         release_kv_cache(
