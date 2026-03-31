@@ -724,11 +724,15 @@ class Indexer(MultiPlatformOp):
         if not return_indices:
             return None
 
-        # MLA: use dummy logits with topk kernel's fast path to generate token indices
-        # [0,1,...,seq_len-1,-1,...].  For HiSparse direct-admit first decode step,
-        # some of these token positions may map to host pool slots that are -1
-        # (uninitialized).  The src_loc<0 guard in load_cache_to_device_buffer_mla
-        # (hisparse.cuh) safely skips copies for such slots, so this is safe.
+        if forward_batch.forward_mode.is_decode():
+            return self._build_decode_k_only_topk(
+                metadata.get_seqlens_expanded(),
+                device=x_meta.device,
+            )
+
+        # Extend path only: when seq_len <= index_topk, a width=index_topk dummy
+        # logits tensor is enough for topk_transform to synthesize safe token
+        # positions [0,1,...,seq_len-1,-1,...].
         seq_lens_expanded = metadata.get_seqlens_expanded()
         dummy_logits = torch.zeros(
             seq_lens_expanded.shape[0],
@@ -737,6 +741,27 @@ class Indexer(MultiPlatformOp):
             device=x_meta.device,
         )
         return metadata.topk_transform(dummy_logits, self.index_topk)
+
+    def _build_decode_k_only_topk(
+        self, seq_lens: torch.Tensor, device: torch.device
+    ) -> torch.Tensor:
+        """Build a safe chronological top-k window for decode warmup.
+
+        For direct-admit HiSparse decode, we only need valid token positions so
+        the swap-in kernel can populate the device buffer and write fresh
+        `index_k` for the current token. Do not call the fused/unfused top-k
+        kernels here: decode seq_lens can be far larger than `index_topk`, while
+        the dummy logits tensor below is only `index_topk` wide.
+        """
+        seq_lens = seq_lens.to(device=device, dtype=torch.int32).view(-1)
+        starts = (seq_lens - self.index_topk).clamp(min=0).unsqueeze(1)
+        offsets = torch.arange(self.index_topk, device=device, dtype=torch.int32)
+        candidate = starts + offsets.unsqueeze(0)
+        return torch.where(
+            candidate < seq_lens.unsqueeze(1),
+            candidate,
+            torch.full_like(candidate, -1),
+        )
 
     def _get_topk_ragged_with_cp(
         self,
