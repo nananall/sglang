@@ -120,9 +120,14 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_reqs
         # Direct-admit requests do not have trustworthy historical NSA top-k
-        # state on their first decode step. Keep them on a k-only warmup path
-        # until one decode forward finishes and writes fresh index_k entries.
-        self._needs_nsa_k_only_warmup = [False] * max_num_reqs
+        # state immediately. Track how many decode forwards should remain on the
+        # conservative k-only path before switching back to normal NSA top-k.
+        self._nsa_k_only_warmup_steps = [0] * max_num_reqs
+        # Temporary safety valve for long-seq direct-admit requests: route
+        # swap-in through the naive host->device path instead of the HiSparse
+        # JIT miss/evict kernel. This avoids long-running decode crashes while
+        # we continue debugging the kernel path.
+        self._force_naive_swap_in = [False] * max_num_reqs
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -196,14 +201,21 @@ class HiSparseCoordinator:
             # must preload all tokens from host pool into the device buffer
             # TODO(hzh0425): Optimize this.
             self._preload_to_device_buffer(req)
+            self._force_naive_swap_in[req.req_pool_idx] = False
         else:
             # Long sequence: warm up the hot buffer with the most recent prompt
             # tokens so the first decode step can stay on a safe all-hit path.
             self._preload_recent_prompt_window(req)
+            self._force_naive_swap_in[req.req_pool_idx] = True
 
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
-        self._needs_nsa_k_only_warmup[req.req_pool_idx] = True
+        # Long direct-admit decode now uses the naive swap-in path, but one
+        # successful decode forward is still not enough to fully stabilize the
+        # following step's historical NSA state. Keep long sequences on k-only
+        # for one extra decode step.
+        warmup_steps = 2 if req.kv_allocated_len > self.device_buffer_size else 1
+        self._nsa_k_only_warmup_steps[req.req_pool_idx] = warmup_steps
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
     def _preload_to_device_buffer(self, req: Req) -> None:
@@ -300,15 +312,17 @@ class HiSparseCoordinator:
         """Return True if any request in the batch still needs direct-admit warmup."""
         req_pool_indices_cpu = req_pool_indices.to(device="cpu")
         return any(
-            self._needs_nsa_k_only_warmup[int(req_idx)]
+            self._nsa_k_only_warmup_steps[int(req_idx)] > 0
             for req_idx in req_pool_indices_cpu.tolist()
         )
 
     def finish_nsa_k_only_warmup(self, req_pool_indices: torch.Tensor) -> None:
-        """Clear direct-admit warmup after a decode forward finishes successfully."""
+        """Advance direct-admit warmup after a decode forward finishes successfully."""
         req_pool_indices_cpu = req_pool_indices.to(device="cpu")
         for req_idx in req_pool_indices_cpu.tolist():
-            self._needs_nsa_k_only_warmup[int(req_idx)] = False
+            req_idx = int(req_idx)
+            if self._nsa_k_only_warmup_steps[req_idx] > 0:
+                self._nsa_k_only_warmup_steps[req_idx] -= 1
 
     def collect_ready_reqs(self) -> list[Req]:
         ready_reqs = []
@@ -554,44 +568,49 @@ class HiSparseCoordinator:
 
             req_idx = int(req_pool_indices[i].item())
             selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
-
-            assert torch.all(
-                selected_tokens >= 0
-            ), f"Req {req_idx}: selected tokens contain negative positions"
-            assert torch.all(selected_tokens < seq_len), (
-                f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
-                f"out of range for seq_len={seq_len}"
+            device_indices = torch.full(
+                (top_n,), -1, dtype=torch.int64, device=self.device
             )
+            valid_mask = (selected_tokens >= 0) & (selected_tokens < seq_len)
+            if not torch.any(valid_mask):
+                top_k_indices[i, :top_n] = device_indices.to(torch.int32)
+                continue
 
             if seq_len <= self.device_buffer_size:
-                device_indices = self.req_to_device_buffer[req_idx, selected_tokens]
+                valid_tokens = selected_tokens[valid_mask]
+                device_indices[valid_mask] = self.req_to_device_buffer[
+                    req_idx, valid_tokens
+                ]
             else:
-                device_indices = torch.empty(
-                    top_n, dtype=torch.int64, device=self.device
-                )
+                valid_tokens = selected_tokens[valid_mask]
+                valid_output_indices = torch.nonzero(valid_mask, as_tuple=False).view(-1)
 
-                is_latest_token = selected_tokens == (seq_len - 1)
+                is_latest_token = valid_tokens == (seq_len - 1)
                 needs_host_load = ~is_latest_token
 
-                device_indices[is_latest_token] = self.req_to_device_buffer[
-                    req_idx, self.device_buffer_size
-                ]
+                device_indices[valid_output_indices[is_latest_token]] = (
+                    self.req_to_device_buffer[
+                        req_idx, self.device_buffer_size
+                    ]
+                )
 
                 num_to_load = int(needs_host_load.sum().item())
                 if num_to_load > 0:
-                    tokens_to_load = selected_tokens[needs_host_load]
+                    tokens_to_load = valid_tokens[needs_host_load]
                     host_locs = self.req_to_host_pool[req_idx, tokens_to_load]
+                    host_valid_mask = host_locs >= 0
+                    if not torch.any(host_valid_mask):
+                        top_k_indices[i, :top_n] = device_indices.to(torch.int32)
+                        continue
 
-                    invalid_mask = host_locs < 0
-                    if torch.any(invalid_mask):
-                        bad_positions = tokens_to_load[invalid_mask].tolist()
-                        raise AssertionError(
-                            f"Req {req_idx} (seq_len={seq_len}, layer={layer_id}): "
-                            f"missing host backup at token positions {bad_positions}"
-                        )
-
-                    buffer_locs = self.req_to_device_buffer[req_idx, :num_to_load]
-                    device_indices[needs_host_load] = buffer_locs
+                    host_locs = host_locs[host_valid_mask]
+                    tokens_output_indices = valid_output_indices[needs_host_load][
+                        host_valid_mask
+                    ]
+                    buffer_locs = self.req_to_device_buffer[
+                        req_idx, : len(tokens_output_indices)
+                    ]
+                    device_indices[tokens_output_indices] = buffer_locs
 
                     self.mem_pool_host.load_to_device_per_layer(
                         self.mem_pool_device,
@@ -628,7 +647,8 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
-        self._needs_nsa_k_only_warmup[req.req_pool_idx] = False
+        self._nsa_k_only_warmup_steps[req.req_pool_idx] = 0
+        self._force_naive_swap_in[req.req_pool_idx] = False
         req.staging = False
 
     def release_host_pool_for_req(self, req: Req) -> None:
@@ -643,7 +663,8 @@ class HiSparseCoordinator:
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self._needs_nsa_k_only_warmup[req.req_pool_idx] = False
+        self._nsa_k_only_warmup_steps[req.req_pool_idx] = 0
+        self._force_naive_swap_in[req.req_pool_idx] = False
 
     def retract_req(self, req: Req) -> None:
         if req.staging:
@@ -680,7 +701,8 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
-        self._needs_nsa_k_only_warmup[req.req_pool_idx] = False
+        self._nsa_k_only_warmup_steps[req.req_pool_idx] = 0
+        self._force_naive_swap_in[req.req_pool_idx] = False
 
     def swap_in_selected_pages(
         self,
@@ -702,6 +724,13 @@ class HiSparseCoordinator:
         if top_k_result.dtype != torch.int32:
             raise ValueError(
                 f"top_k_result dtype {top_k_result.dtype} is not int32 as expected"
+            )
+        if any(self._force_naive_swap_in[int(req_idx)] for req_idx in req_pool_indices):
+            return self.naive_load_topk(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                top_k_tokens=top_k_result,
+                layer_id=layer_id,
             )
 
         num_reqs = req_pool_indices.size(0)

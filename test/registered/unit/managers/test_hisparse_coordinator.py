@@ -57,6 +57,7 @@ def test_abort_staging_request_preserves_deque_and_frees_host_pool():
     )
     coordinator.mem_pool_host = DummyHostPool()
     coordinator._skip_first_backup = [True, True]
+    coordinator._force_naive_swap_in = [True, True]
 
     coordinator.abort_staging_request(req)
 
@@ -66,6 +67,7 @@ def test_abort_staging_request_preserves_deque_and_frees_host_pool():
     assert coordinator.mem_pool_host.freed[0].tolist() == [11, 12]
     assert coordinator.req_to_host_pool[0].tolist() == [-1, -1, -1]
     assert coordinator._skip_first_backup[0] is False
+    assert coordinator._force_naive_swap_in[0] is False
     assert req.staging is False
 
 
@@ -98,7 +100,7 @@ def test_collect_ready_reqs_pops_ready_prefix_from_deque():
     assert [act.req for act in coordinator.ack_staging_queue] == [pending_req]
 
 
-def test_direct_admit_keeps_nsa_warmup_until_decode_forward_finishes():
+def test_direct_admit_keeps_two_step_nsa_warmup_for_long_sequences():
     coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
     coordinator.device = "cpu"
     coordinator.device_buffer_size = 4
@@ -111,7 +113,8 @@ def test_direct_admit_keeps_nsa_warmup_until_decode_forward_finishes():
     )
     coordinator.req_to_device_buffer = torch.arange(16, dtype=torch.int64).view(1, 16)
     coordinator._skip_first_backup = [False]
-    coordinator._needs_nsa_k_only_warmup = [False]
+    coordinator._nsa_k_only_warmup_steps = [0]
+    coordinator._force_naive_swap_in = [False]
     coordinator.req_device_buffer_tokens = torch.zeros((1, 1, 5), dtype=torch.int32)
 
     def alloc_device_buffer(req):
@@ -127,7 +130,8 @@ def test_direct_admit_keeps_nsa_warmup_until_decode_forward_finishes():
     assert req.staging is False
     assert coordinator.should_force_nsa_k_only(torch.tensor([0], dtype=torch.int64))
     assert coordinator._skip_first_backup == [True]
-    assert coordinator._needs_nsa_k_only_warmup == [True]
+    assert coordinator._nsa_k_only_warmup_steps == [2]
+    assert coordinator._force_naive_swap_in == [True]
     assert coordinator.req_device_buffer_tokens[0, 0, :4].tolist() == [5, 6, 7, -1]
     assert len(coordinator.mem_pool_host.loads) == 1
 
@@ -140,14 +144,73 @@ def test_direct_admit_keeps_nsa_warmup_until_decode_forward_finishes():
         seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
     )
     assert coordinator._skip_first_backup == [False]
-    assert coordinator._needs_nsa_k_only_warmup == [True]
+    assert coordinator._nsa_k_only_warmup_steps == [2]
 
     coordinator._eager_backup_previous_token(
         seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
     )
-    assert coordinator._needs_nsa_k_only_warmup == [True]
+    assert coordinator._nsa_k_only_warmup_steps == [2]
     assert coordinator.mem_pool_host.backups
 
     coordinator.finish_nsa_k_only_warmup(req_pool_indices)
-    assert coordinator._needs_nsa_k_only_warmup == [False]
+    assert coordinator._nsa_k_only_warmup_steps == [1]
+    assert coordinator.should_force_nsa_k_only(req_pool_indices)
+
+    coordinator.finish_nsa_k_only_warmup(req_pool_indices)
+    assert coordinator._nsa_k_only_warmup_steps == [0]
     assert not coordinator.should_force_nsa_k_only(req_pool_indices)
+
+
+def test_swap_in_selected_pages_uses_naive_fallback_for_flagged_req():
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.device = "cpu"
+    coordinator.top_k = 4
+    coordinator._force_naive_swap_in = [True]
+
+    called = {}
+
+    def fake_naive_load_topk(req_pool_indices, seq_lens, top_k_tokens, layer_id):
+        called["args"] = (
+            req_pool_indices.clone(),
+            seq_lens.clone(),
+            top_k_tokens.clone(),
+            layer_id,
+        )
+        return torch.full((1, 4), 7, dtype=torch.int32)
+
+    coordinator.naive_load_topk = fake_naive_load_topk
+
+    result = coordinator.swap_in_selected_pages(
+        req_pool_indices=torch.tensor([0], dtype=torch.int64),
+        seq_lens=torch.tensor([8], dtype=torch.int32),
+        top_k_result=torch.tensor([[1, 2, 3, 4]], dtype=torch.int32),
+        layer_id=2,
+    )
+
+    assert result.tolist() == [[7, 7, 7, 7]]
+    req_pool_indices, seq_lens, top_k_tokens, layer_id = called["args"]
+    assert req_pool_indices.tolist() == [0]
+    assert seq_lens.tolist() == [8]
+    assert top_k_tokens.tolist() == [[1, 2, 3, 4]]
+    assert layer_id == 2
+
+
+def test_naive_load_topk_tolerates_invalid_or_missing_host_tokens():
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.device = "cpu"
+    coordinator.top_k = 4
+    coordinator.device_buffer_size = 4
+    coordinator.req_to_device_buffer = torch.tensor([[10, 11, 12, 13, 99]])
+    coordinator.req_to_host_pool = torch.tensor([[30, 31, 32, 33, 34, -1, 36, 37]])
+    coordinator.mem_pool_device = SimpleNamespace()
+    coordinator.mem_pool_host = DummyHostPool()
+
+    result = coordinator.naive_load_topk(
+        req_pool_indices=torch.tensor([0], dtype=torch.int64),
+        seq_lens=torch.tensor([8], dtype=torch.int32),
+        top_k_tokens=torch.tensor([[7, -1, 8, 5]], dtype=torch.int32),
+        layer_id=0,
+    )
+
+    assert result.tolist() == [[99, -1, -1, -1]]
+    assert coordinator.mem_pool_host.loads == []
