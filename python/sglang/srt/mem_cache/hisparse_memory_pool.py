@@ -315,18 +315,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens, seq_lens_cpu, last_loc
         )
 
-        return logical_indices
-
-    def alloc_decode_debug(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
-    ):
-        logical_indices = self.logical_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
-        )
-
         hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
         hisparse_indices = self.hisparse_attn_allocator.alloc_decode(
             seq_lens,
