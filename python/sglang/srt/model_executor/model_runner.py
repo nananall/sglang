@@ -2526,12 +2526,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
+        result = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
+        self._finish_hisparse_decode_warmup(forward_batch)
+        return result
 
     def forward_extend(
         self,
