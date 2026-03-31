@@ -1537,6 +1537,13 @@ class NativeSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
             )
+            # swap_in_selected_pages returns hisparse device slot indices
+            # (page_size=1 convention from hisparse_attn_allocator).
+            # flashmla_kv reshapes kv_cache as (-1, real_page_size, 1, kv_dim) and
+            # expects block indices (slot // real_page_size).  All hisparse slots are
+            # allocated with page_size=64 alignment, so the division is exact.
+            if self.nsa_decode_impl == "flashmla_kv":
+                page_table_1 = page_table_1 // self.real_page_size
         elif envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
