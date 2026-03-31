@@ -724,23 +724,11 @@ class Indexer(MultiPlatformOp):
         if not return_indices:
             return None
 
-        # MLA: return top-k indices.
-        # For HiSparse direct-admit first decode step, use the front tokens already
-        # in the device buffer — these are guaranteed to have valid host backup slots.
-        # Using dummy zeros here would generate [0,1,...,N-1] indices which for long
-        # sequences may reference host pool slots that are still -1 (uninitialized),
-        # causing an illegal memory access in swap_in_selected_pages.
-        if (
-            forward_batch.forward_mode.is_decode()
-            and forward_batch.hisparse_coordinator is not None
-        ):
-            return forward_batch.hisparse_coordinator.get_front_topk_tokens(
-                forward_batch.req_pool_indices[: forward_batch.batch_size],
-                forward_batch.seq_lens.to(torch.int64),
-            )
-
-        # Prefill k_only fast path: use dummy logits with topk kernel.
-        # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
+        # MLA: use dummy logits with topk kernel's fast path to generate token indices
+        # [0,1,...,seq_len-1,-1,...].  For HiSparse direct-admit first decode step,
+        # some of these token positions may map to host pool slots that are -1
+        # (uninitialized).  The src_loc<0 guard in load_cache_to_device_buffer_mla
+        # (hisparse.cuh) safely skips copies for such slots, so this is safe.
         seq_lens_expanded = metadata.get_seqlens_expanded()
         dummy_logits = torch.zeros(
             seq_lens_expanded.shape[0],
