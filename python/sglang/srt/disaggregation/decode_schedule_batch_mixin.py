@@ -27,44 +27,58 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         self.forward_mode = ForwardMode.PREBUILT
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = []
         pre_lens = []
+        extend_lens = []
         req_pool_indices = []
+        input_ids = []
 
-        # Pre-calculate total size
-        total_size = sum(req.extend_input_len for req in reqs)
-        out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
+        for req in reqs:
+            assert req.req_pool_idx is not None, "prebuilt req must have req_pool_idx"
 
-        # Fill the tensor in one pass
-        offset = 0
-        for i, req in enumerate(reqs):
-            req_pool_indices.append(req.req_pool_idx)
-
-            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                : req.extend_input_len
-            ]
-            assert (
-                offset + req.extend_input_len <= total_size
-            ), f"Exceeds total size: offset={offset}, req.extend_input_len={req.extend_input_len}, total_size={total_size}"
-            out_cache_loc[offset : offset + req.extend_input_len] = chunk
-            offset += req.extend_input_len
-
+            # The decode-side metadata already carries the first generated token,
+            # but its KV is not committed yet. PREBUILT must only consume the
+            # committed prompt KV range that was pre-allocated during transfer.
+            seq_len = req.kv_committed_len
             pre_len = len(req.prefix_indices)
-            seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
+            assert pre_len <= seq_len, f"{pre_len=} > {seq_len=} for {req.rid=}"
+
+            committed_fill_ids = (req.origin_input_ids + req.output_ids)[:seq_len]
+            req.fill_ids = committed_fill_ids
+            req.set_extend_input_len(seq_len - pre_len)
+
+            req_pool_indices.append(req.req_pool_idx)
             seq_lens.append(seq_len)
-            if len(req.output_ids) == 0:
-                assert (
-                    seq_len - pre_len == req.extend_input_len
-                ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
+            pre_lens.append(pre_len)
+            extend_lens.append(req.extend_input_len)
+            input_ids.append(committed_fill_ids[pre_len:])
 
             if not req.retracted_stain:
                 req.cached_tokens += pre_len - req.already_computed
                 req.already_computed = seq_len
             req.is_retracted = False
-            pre_lens.append(pre_len)
             req.extend_logprob_start_len = 0
+
+        extend_num_tokens = sum(extend_lens)
+        out_cache_loc = torch.empty(
+            extend_num_tokens, dtype=torch.int64, device=self.device
+        )
+
+        # PREBUILT should only address the committed uncached KV range.
+        offset = 0
+        for req, pre_len, seq_len, extend_len in zip(
+            reqs, pre_lens, seq_lens, extend_lens
+        ):
+            if extend_len == 0:
+                continue
+            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                pre_len:seq_len
+            ]
+            out_cache_loc[offset : offset + extend_len] = chunk
+            offset += extend_len
+        assert (
+            offset == extend_num_tokens
+        ), f"prebuilt kv slice mismatch: {offset=} vs {extend_num_tokens=}"
 
         extend_input_logprob_token_ids = None
 

@@ -111,7 +111,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
     for (int i = tid; i < count; i += BLOCK_SIZE) {
       int32_t token_pos = req_top_k_tokens[i];
-      if (token_pos >= 0) {
+      if (token_pos >= 0 && token_pos < seq_len) {
         req_top_k_device_locs[i] = req_device_buffer_locs[token_pos];
       }
     }
@@ -133,11 +133,13 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   __shared__ int32_t s_total_hits;
   __shared__ int32_t s_newest_hit;
+  __shared__ int32_t s_ignored_top_k;
 
   // Initialize shared memory: counters, hash table, prefix-sum offsets.
   if (tid == 0) {
     s_total_hits = 0;
     s_newest_hit = 0;
+    s_ignored_top_k = 0;
   }
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
@@ -154,7 +156,13 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
-    if (token_idx == newest_token) {
+    if (token_idx < 0 || token_idx >= seq_len) {
+      // Ignore invalid top-k outputs defensively. This can happen when the
+      // first direct-admit decode step runs with partially initialized index-k
+      // state; treating them as ignored avoids indexing host_cache_locs OOB.
+      s_top_k_tokens[i] = TOKEN_HIT;
+      atomicAdd(&s_ignored_top_k, 1);
+    } else if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
@@ -306,27 +314,29 @@ __global__ void load_cache_to_device_buffer_kernel(
     if (is_miss) {
       int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
       int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
-      // Reuse s_top_k_tokens as miss scratch: miss_offset < my_token_idx always
-      // holds (hits are skipped), so compacted writes never overrun pending reads.
+      // Reuse s_top_k_tokens / s_hash_vals as miss scratch: miss_offset <
+      // my_token_idx always holds (hits are skipped), so compacted writes never
+      // overrun pending reads.
       s_top_k_tokens[miss_offset] = my_token;
-      req_top_k_device_locs[my_token_idx] = req_device_buffer_locs[evict_slot];
-      req_device_buffer_tokens[evict_slot] = my_token;
+      s_hash_vals[miss_offset] = static_cast<int16_t>(my_token_idx);
     }
   }
   __syncthreads();
 
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit - s_ignored_top_k;
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];
+    const int16_t top_k_idx = s_hash_vals[miss_idx];
     const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
 
+    if (miss_token < 0 || miss_token >= seq_len) continue;
     const int64_t src_loc = req_host_cache_locs[miss_token];
     // Guard: skip copy when host slot is uninitialized (-1). This can happen in
     // the PD direct-to-host path where index_k_with_scale_buffer starts as zeros
     // and the first decode step may select tokens whose host backup is not yet
-    // present.  Skipping the copy leaves the evict slot with stale data but
-    // avoids an illegal memory access crash; correctness recovers on later steps.
+    // present. In that case we leave the miss unresolved (device loc stays -1 and
+    // the evict slot metadata is unchanged) instead of returning stale KV as valid.
     if (src_loc < 0) continue;
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
 
@@ -338,6 +348,11 @@ __global__ void load_cache_to_device_buffer_kernel(
       const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
       auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
       transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+    }
+
+    if (lane_id == 0) {
+      req_top_k_device_locs[top_k_idx] = req_device_buffer_locs[evict_slot];
+      req_device_buffer_tokens[evict_slot] = miss_token;
     }
   }
 }

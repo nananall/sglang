@@ -1,7 +1,8 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple
+from collections import deque
+from typing import NamedTuple
 
 import torch
 
@@ -78,7 +79,7 @@ class HiSparseCoordinator:
         )
 
         self.write_staging_stream = device_module.Stream()
-        self.ack_staging_queue: List[HiSparseAct] = []
+        self.ack_staging_queue: deque[HiSparseAct] = deque()
         self.decode_producer_stream = None
 
         self.tp_group = tp_group
@@ -257,7 +258,7 @@ class HiSparseCoordinator:
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
 
-    def collect_ready_reqs(self) -> List[Req]:
+    def collect_ready_reqs(self) -> list[Req]:
         ready_reqs = []
         if len(self.ack_staging_queue) == 0:
             return ready_reqs
@@ -277,7 +278,7 @@ class HiSparseCoordinator:
             )
         finish_count = int(queue_size.item())
         while finish_count > 0:
-            _, _, req = self.ack_staging_queue.pop(0)
+            _, _, req = self.ack_staging_queue.popleft()
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
             req.staging = False
