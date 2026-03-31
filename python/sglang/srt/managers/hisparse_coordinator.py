@@ -123,11 +123,15 @@ class HiSparseCoordinator:
         # state immediately. Track how many decode forwards should remain on the
         # conservative k-only path before switching back to normal NSA top-k.
         self._nsa_k_only_warmup_steps = [0] * max_num_reqs
-        # Temporary safety valve for long-seq direct-admit requests: route
-        # swap-in through the naive host->device path instead of the HiSparse
-        # JIT miss/evict kernel. This avoids long-running decode crashes while
-        # we continue debugging the kernel path.
-        self._force_naive_swap_in = [False] * max_num_reqs
+        # Number of remaining decode steps that should use the naive (Python)
+        # swap-in path instead of the JIT kernel.  Set to a small positive value
+        # on long-seq direct-admit to let the hot buffer stabilise; automatically
+        # decremented to 0 after that many steps so the fast path is restored.
+        self._naive_swap_in_steps = [0] * max_num_reqs
+        # Async stream for backing up decode tokens to host without blocking
+        # the main forward stream.
+        self.decode_backup_stream = device_module.Stream()
+        self.pending_decode_backup_event = None
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -196,24 +200,21 @@ class HiSparseCoordinator:
         self.alloc_device_buffer(req)
 
         if req.kv_allocated_len <= self.device_buffer_size:
-            # Short sequences (seq_len <= device_buffer_size): the kernel fast path
-            # returns device_buffer_locs directly without any host loading, so we
-            # must preload all tokens from host pool into the device buffer
-            # TODO(hzh0425): Optimize this.
+            # Short sequences: kernel fast path returns device_buffer_locs
+            # directly, so we must preload all tokens into the device buffer first.
             self._preload_to_device_buffer(req)
-            self._force_naive_swap_in[req.req_pool_idx] = False
+            self._naive_swap_in_steps[req.req_pool_idx] = 0
         else:
             # Long sequence: warm up the hot buffer with the most recent prompt
             # tokens so the first decode step can stay on a safe all-hit path.
             self._preload_recent_prompt_window(req)
-            self._force_naive_swap_in[req.req_pool_idx] = True
+            # Use the naive swap-in for a small number of initial decode steps
+            # to let the JIT kernel's LRU hot-buffer stabilise after direct-admit.
+            # After these steps expire the fast JIT path is automatically restored.
+            self._naive_swap_in_steps[req.req_pool_idx] = 2
 
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
-        # Long direct-admit decode now uses the naive swap-in path, but one
-        # successful decode forward is still not enough to fully stabilize the
-        # following step's historical NSA state. Keep long sequences on k-only
-        # for one extra decode step.
         warmup_steps = 2 if req.kv_allocated_len > self.device_buffer_size else 1
         self._nsa_k_only_warmup_steps[req.req_pool_idx] = warmup_steps
         logger.debug("HiSparse: admitting request %s directly", req.rid)
@@ -473,9 +474,6 @@ class HiSparseCoordinator:
         The only exception is the first decode step right after staging: all
         prefill tokens were already backed up during staging, so there is nothing new to save yet.
         """
-        if self.decode_producer_stream is not None:
-            device_module.current_stream().wait_stream(self.decode_producer_stream)
-
         # Build the list of batch positions that need a host backup.
         # Skip the first decode step after staging (prefill already backed up).
         backup_indices = []
@@ -513,12 +511,26 @@ class HiSparseCoordinator:
         host_locs = host_locs.to(device=self.device)
         self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
 
-        self.mem_pool_host.backup_from_device_all_layer(
-            self.mem_pool_device,
-            host_locs,
-            device_locs.contiguous(),
-            io_backend="kernel",
-        )
+        # Issue the backup asynchronously on a dedicated stream so the host→device
+        # copy does not block the main forward stream.
+        current_stream = device_module.current_stream()
+        finish_event = device_module.Event()
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(current_stream)
+            if self.decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs.contiguous(),
+                io_backend="kernel",
+            )
+            finish_event.record()
+            if host_locs.is_cuda:
+                host_locs.record_stream(self.decode_backup_stream)
+            if device_locs.is_cuda:
+                device_locs.record_stream(self.decode_backup_stream)
+        self.pending_decode_backup_event = finish_event
 
     def get_front_topk_tokens(
         self,
@@ -648,7 +660,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
         self._nsa_k_only_warmup_steps[req.req_pool_idx] = 0
-        self._force_naive_swap_in[req.req_pool_idx] = False
+        self._naive_swap_in_steps[req.req_pool_idx] = 0
         req.staging = False
 
     def release_host_pool_for_req(self, req: Req) -> None:
@@ -664,7 +676,7 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._nsa_k_only_warmup_steps[req.req_pool_idx] = 0
-        self._force_naive_swap_in[req.req_pool_idx] = False
+        self._naive_swap_in_steps[req.req_pool_idx] = 0
 
     def retract_req(self, req: Req) -> None:
         if req.staging:
@@ -702,7 +714,7 @@ class HiSparseCoordinator:
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
         self._nsa_k_only_warmup_steps[req.req_pool_idx] = 0
-        self._force_naive_swap_in[req.req_pool_idx] = False
+        self._naive_swap_in_steps[req.req_pool_idx] = 0
 
     def swap_in_selected_pages(
         self,
@@ -725,13 +737,29 @@ class HiSparseCoordinator:
             raise ValueError(
                 f"top_k_result dtype {top_k_result.dtype} is not int32 as expected"
             )
-        if any(self._force_naive_swap_in[int(req_idx)] for req_idx in req_pool_indices):
+        # Check if any request still has remaining naive-swap-in steps.
+        # Decrement the counter only on the first layer call per decode step
+        # (layer_id == 0) so each decode step counts as one step regardless of
+        # how many layers are processed.
+        has_naive = any(
+            self._naive_swap_in_steps[int(req_idx)] > 0 for req_idx in req_pool_indices
+        )
+        if has_naive:
+            if layer_id == 0:
+                for req_idx in req_pool_indices:
+                    idx = int(req_idx)
+                    if self._naive_swap_in_steps[idx] > 0:
+                        self._naive_swap_in_steps[idx] -= 1
             return self.naive_load_topk(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 top_k_tokens=top_k_result,
                 layer_id=layer_id,
             )
+        # Wait for any in-flight async backup before reading device buffer.
+        if self.pending_decode_backup_event is not None:
+            device_module.current_stream().wait_event(self.pending_decode_backup_event)
+            self.pending_decode_backup_event = None
 
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
