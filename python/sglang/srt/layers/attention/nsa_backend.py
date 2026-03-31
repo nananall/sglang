@@ -1384,6 +1384,12 @@ class NativeSparseAttnBackend(
                     page_table_1
                 )
             )
+            # translate_loc_to_hisparse_device returns hisparse device slot indices
+            # (page_size=1 convention). flashmla_kv reshapes kv_cache as
+            # (-1, real_page_size, 1, kv_dim) and expects block indices
+            # (slot // real_page_size). All hisparse slots are 64-aligned.
+            if nsa_impl == "flashmla_kv":
+                page_table_1 = page_table_1 // self.real_page_size
 
         if nsa_impl == "tilelang":
             if q_rope is not None:
