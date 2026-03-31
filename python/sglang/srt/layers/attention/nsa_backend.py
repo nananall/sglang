@@ -1768,7 +1768,13 @@ class NativeSparseAttnBackend(
         FlashMLA decode/sparse kernels to read out of bounds. Clamp everything
         into the valid block range before launching the kernel.
         """
-        max_block_idx = max(kv_cache.shape[0] // self.real_page_size - 1, 0)
+        if kv_cache.ndim >= 4 and kv_cache.shape[1] == self.real_page_size:
+            # flashmla_kv reshapes cache to (num_blocks, page_size, ...)
+            num_blocks = kv_cache.shape[0]
+        else:
+            # flashmla_sparse keeps cache flat in token-slot layout.
+            num_blocks = kv_cache.shape[0] // self.real_page_size
+        max_block_idx = max(num_blocks - 1, 0)
         return page_table_1.clamp(min=0, max=max_block_idx)
 
     def _forward_standard_mha(
