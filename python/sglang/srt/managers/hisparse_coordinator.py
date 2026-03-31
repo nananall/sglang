@@ -10,6 +10,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
     fused_store_index_k_cache,
 )
 from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+from sglang.srt.layers.attention.nsa.triton_kernel import act_quant as _act_quant
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseNSATokenToKVPool,
@@ -221,35 +222,25 @@ class HiSparseCoordinator:
         potentially referencing uninitialized host-pool entries and triggering
         CUDA illegal memory access.
 
-        We read the first index_head_dim (128) bf16 values per token from the
-        host pool (pinned CPU memory), copy them to GPU, and call
-        fused_store_index_k_cache to quantize + write into the logical pages of
-        index_k_with_scale_buffer.
-
-        The fused kernel expects:
-          key:            (N, 128) bf16  CUDA
-          index_k_with_scale: (num_pages, 64*132) uint8  CUDA
-          out_cache_loc:  (N,) int64  CUDA   ← logical indices
+        Two paths:
+          Fast path : fused_store_index_k_cache (JIT kernel, page_size=64, non-fnuz)
+          Fallback  : act_quant (Triton) + set_index_k_scale_buffer (page_size-agnostic)
         """
         if not _is_cuda:
             return
 
         n = req.kv_allocated_len
         index_head_dim = self.mem_pool_device.index_head_dim  # == 128
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]  # (n,) int64 GPU
+        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]  # (n,) GPU
 
         # Logical slot indices for this request (written by _pre_alloc)
         out_cache_loc = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :n
         ].to(torch.int64)  # (n,) int64 GPU
 
-        # Check fused-store availability once (not per layer).
-        if not can_use_nsa_fused_store(
+        use_fused = can_use_nsa_fused_store(
             torch.bfloat16, out_cache_loc.dtype, self.mem_pool_device.page_size
-        ):
-            # fused kernel unavailable (non-CUDA or fnuz fp8); skip silently.
-            # NSA indexer will fall back to all-zero logits as before.
-            return
+        )
 
         # Pull host indices to CPU once; reuse for every layer.
         host_indices_cpu = host_indices.cpu()
@@ -258,30 +249,48 @@ class HiSparseCoordinator:
             self.mem_pool_device.start_layer,
             self.mem_pool_device.start_layer + self.mem_pool_device.layer_num,
         ):
-            buf = self.mem_pool_device.get_index_k_with_scale_buffer(layer_id)
-
             # host_kv_buf layout (layer_first): (host_size, 1, kv_cache_dim) bf16 CPU
             host_layer_idx = layer_id - self.mem_pool_device.start_layer
             host_kv_buf = self.mem_pool_host.kv_buffer[host_layer_idx]
 
-            # Gather key slice for this request: (n, 128) CPU bf16
-            key_host = host_kv_buf[host_indices_cpu, 0, :index_head_dim]
+            # Gather key slice for this request: (n, 128) CPU bf16, then make contiguous
+            key_host = host_kv_buf[host_indices_cpu, 0, :index_head_dim].contiguous()
 
-            # Upload to GPU (non-blocking H2D copy from pinned memory)
-            key_gpu = key_host.to(device=self.device, non_blocking=True)  # (n, 128) GPU bf16
+            # Blocking H2D copy (must be synchronous so kernel sees valid data)
+            key_gpu = key_host.to(device=self.device, non_blocking=False)  # (n, 128) GPU bf16
 
-            fused_store_index_k_cache(
-                key_gpu,
-                buf,
-                out_cache_loc,
-                self.mem_pool_device.page_size,
-            )
+            if use_fused:
+                # Fast path: JIT fused fp8-quantize + scatter into paged buffer
+                buf = self.mem_pool_device.get_index_k_with_scale_buffer(layer_id)
+                fused_store_index_k_cache(
+                    key_gpu,
+                    buf,
+                    out_cache_loc,
+                    self.mem_pool_device.page_size,
+                )
+            else:
+                # Fallback: Triton act_quant + set_index_k_scale_buffer
+                # Works for any page_size (incl. 1) and fnuz fp8 variants.
+                block_size = self.mem_pool_device.quant_block_size  # == 128
+                scale_fmt = getattr(self.mem_pool_device, "scale_fmt", None)
+                k_fp8, k_scale = _act_quant(key_gpu, block_size, scale_fmt)
+                out_loc = out_cache_loc.to(torch.int32)
+                if not out_loc.is_contiguous():
+                    out_loc = out_loc.contiguous()
+                self.mem_pool_device.set_index_k_scale_buffer(
+                    layer_id=layer_id,
+                    loc=out_loc,
+                    index_k=k_fp8,
+                    index_k_scale=k_scale,
+                )
 
         logger.debug(
-            "HiSparse: filled index_k_with_scale_buffer for req %s (%d tokens, %d layers)",
+            "HiSparse: filled index_k_with_scale_buffer for req %s "
+            "(%d tokens, %d layers, fused=%s)",
             req.rid,
             n,
             self.mem_pool_device.layer_num,
+            use_fused,
         )
 
     def _preload_to_device_buffer(self, req: Req) -> None:
