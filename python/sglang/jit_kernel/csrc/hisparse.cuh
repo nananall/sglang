@@ -322,6 +322,12 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
 
     const int64_t src_loc = req_host_cache_locs[miss_token];
+    // Guard: skip copy when host slot is uninitialized (-1). This can happen in
+    // the PD direct-to-host path where index_k_with_scale_buffer starts as zeros
+    // and the first decode step may select tokens whose host backup is not yet
+    // present.  Skipping the copy leaves the evict slot with stale data but
+    // avoids an illegal memory access crash; correctness recovers on later steps.
+    if (src_loc < 0) continue;
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
 
     const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
