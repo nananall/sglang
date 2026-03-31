@@ -24,7 +24,7 @@ def _jit_sparse_module(
         item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla
     )
     return load_jit(
-        "sparse_cache",
+        "sparse_cache_v2",
         *cache_args,
         cuda_files=["hisparse.cuh"],
         cuda_wrappers=[
