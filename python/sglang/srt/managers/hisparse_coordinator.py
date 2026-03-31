@@ -400,7 +400,17 @@ class HiSparseCoordinator:
             :, req_pool_indices, self.device_buffer_size
         ] = reserved_buffer_loc.to(torch.int32)
 
-        # todo, clear the prior mapping as well
+        # Release the hisparse device index that alloc_decode() wrote for this
+        # decode step's new token slot.  map_last_loc_to_buffer() is about to
+        # remap out_cache_loc to the HiSparse device-buffer slot
+        # (reserved_buffer_loc), so the slot that alloc_decode() allocated from
+        # hisparse_attn_allocator is no longer reachable and must be freed here
+        # to prevent a one-slot-per-decode-step leak.
+        prior_hisparse_index = (
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[out_cache_loc]
+        )
+        self.token_to_kv_pool_allocator.free_hisparse_indices(prior_hisparse_index)
+
         self.mem_pool_device.full_to_hisparse_device_index_mapping[out_cache_loc] = (
             reserved_buffer_loc
         )
