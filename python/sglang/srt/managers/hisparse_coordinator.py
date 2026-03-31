@@ -208,10 +208,12 @@ class HiSparseCoordinator:
             # Long sequence: warm up the hot buffer with the most recent prompt
             # tokens so the first decode step can stay on a safe all-hit path.
             self._preload_recent_prompt_window(req)
-            # Use the naive swap-in for a small number of initial decode steps
-            # to let the JIT kernel's LRU hot-buffer stabilise after direct-admit.
-            # After these steps expire the fast JIT path is automatically restored.
-            self._naive_swap_in_steps[req.req_pool_idx] = 2
+            # Use the naive swap-in path for long-seq direct-admit requests.
+            # The JIT kernel has an unresolved OOB on long sequences after
+            # direct-admit; keep naive path until the root cause is fixed.
+            # TODO: investigate load_cache_to_device_buffer OOB on long seq
+            # and lower this value once the kernel is safe.
+            self._naive_swap_in_steps[req.req_pool_idx] = 9999
 
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
@@ -530,6 +532,10 @@ class HiSparseCoordinator:
                 host_locs.record_stream(self.decode_backup_stream)
             if device_locs.is_cuda:
                 device_locs.record_stream(self.decode_backup_stream)
+            # backup_req_indices is a temporary GPU tensor; keep it alive
+            # until the backup stream finishes to prevent early deallocation.
+            if backup_req_indices.is_cuda:
+                backup_req_indices.record_stream(self.decode_backup_stream)
         self.pending_decode_backup_event = finish_event
 
     def get_front_topk_tokens(
@@ -738,16 +744,13 @@ class HiSparseCoordinator:
                 f"top_k_result dtype {top_k_result.dtype} is not int32 as expected"
             )
         # Check if any request still has remaining naive-swap-in steps.
-        # Decrement the counter only on the first layer call per decode step
-        # (layer_id == 0) so each decode step counts as one step regardless of
-        # how many layers are processed.
-        has_naive = any(
-            self._naive_swap_in_steps[int(req_idx)] > 0 for req_idx in req_pool_indices
-        )
+        # Use CPU copy of req_pool_indices to avoid GPU sync in the hot path.
+        # Decrement only on layer_id==0 so each decode step counts once.
+        req_pool_indices_cpu = req_pool_indices.tolist()
+        has_naive = any(self._naive_swap_in_steps[idx] > 0 for idx in req_pool_indices_cpu)
         if has_naive:
             if layer_id == 0:
-                for req_idx in req_pool_indices:
-                    idx = int(req_idx)
+                for idx in req_pool_indices_cpu:
                     if self._naive_swap_in_steps[idx] > 0:
                         self._naive_swap_in_steps[idx] -= 1
             return self.naive_load_topk(
