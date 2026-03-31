@@ -26,6 +26,7 @@ class DummyHostPool:
     def __init__(self):
         self.freed = []
         self.backups = []
+        self.loads = []
 
     def free(self, indices: torch.Tensor) -> None:
         self.freed.append(indices.clone())
@@ -35,6 +36,9 @@ class DummyHostPool:
 
     def backup_from_device_all_layer(self, *args, **kwargs) -> None:
         self.backups.append((args, kwargs))
+
+    def load_to_device_per_layer(self, *args, **kwargs) -> None:
+        self.loads.append((args, kwargs))
 
 
 def test_abort_staging_request_preserves_deque_and_frees_host_pool():
@@ -98,10 +102,13 @@ def test_direct_admit_keeps_nsa_warmup_until_decode_forward_finishes():
     coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
     coordinator.device = "cpu"
     coordinator.device_buffer_size = 4
+    coordinator.top_k = 4
     coordinator.decode_producer_stream = None
-    coordinator.mem_pool_device = SimpleNamespace()
+    coordinator.mem_pool_device = SimpleNamespace(layer_num=1)
     coordinator.mem_pool_host = DummyHostPool()
-    coordinator.req_to_host_pool = torch.full((1, 16), -1, dtype=torch.int64)
+    coordinator.req_to_host_pool = torch.tensor(
+        [[100, 101, 102, 103, 104, 105, 106, 107] + [-1] * 8], dtype=torch.int64
+    )
     coordinator.req_to_device_buffer = torch.arange(16, dtype=torch.int64).view(1, 16)
     coordinator._skip_first_backup = [False]
     coordinator._needs_nsa_k_only_warmup = [False]
@@ -121,6 +128,8 @@ def test_direct_admit_keeps_nsa_warmup_until_decode_forward_finishes():
     assert coordinator.should_force_nsa_k_only(torch.tensor([0], dtype=torch.int64))
     assert coordinator._skip_first_backup == [True]
     assert coordinator._needs_nsa_k_only_warmup == [True]
+    assert coordinator.req_device_buffer_tokens[0, 0, :4].tolist() == [5, 6, 7, -1]
+    assert len(coordinator.mem_pool_host.loads) == 1
 
     seq_lens = torch.tensor([8], dtype=torch.int64)
     req_pool_indices = torch.tensor([0], dtype=torch.int64)

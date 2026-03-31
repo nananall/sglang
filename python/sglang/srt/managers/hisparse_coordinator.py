@@ -197,11 +197,9 @@ class HiSparseCoordinator:
             # TODO(hzh0425): Optimize this.
             self._preload_to_device_buffer(req)
         else:
-            # Long sequence: reset device_buffer_tokens to -1 so the kernel
-            # sees all slots as empty → every top-k lookup is a miss → host load.
-            self.req_device_buffer_tokens[
-                :, req.req_pool_idx, : self.device_buffer_size
-            ] = -1
+            # Long sequence: warm up the hot buffer with the most recent prompt
+            # tokens so the first decode step can stay on a safe all-hit path.
+            self._preload_recent_prompt_window(req)
 
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
@@ -222,6 +220,41 @@ class HiSparseCoordinator:
                 layer_id,
                 io_backend="kernel",
             )
+
+    def _preload_recent_prompt_window(self, req: Req) -> None:
+        """Preload the most recent prompt tokens for the first direct-admit decode.
+
+        This keeps the initial k-only warmup path on device-buffer hits and avoids
+        stressing the long-sequence miss path before the decode-side hot buffer has
+        been populated once.
+        """
+        preload_n = min(self.top_k - 1, self.device_buffer_size, req.kv_allocated_len)
+        self.req_device_buffer_tokens[
+            :, req.req_pool_idx, : self.device_buffer_size
+        ] = -1
+        if preload_n <= 0:
+            return
+
+        start_pos = req.kv_allocated_len - preload_n
+        end_pos = req.kv_allocated_len
+        host_indices = self.req_to_host_pool[req.req_pool_idx, start_pos:end_pos]
+        device_locs = self.req_to_device_buffer[req.req_pool_idx, :preload_n]
+
+        for layer_id in range(self.mem_pool_device.layer_num):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_locs,
+                layer_id,
+                io_backend="kernel",
+            )
+
+        warm_tokens = torch.arange(
+            start_pos, end_pos, dtype=torch.int32, device=self.device
+        )
+        self.req_device_buffer_tokens[
+            :, req.req_pool_idx, :preload_n
+        ] = warm_tokens.view(1, -1)
 
     def alloc_device_buffer(self, req: Req) -> None:
         allocated_indices = self.req_to_token_pool.req_to_token[
