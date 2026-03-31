@@ -400,20 +400,16 @@ class HiSparseCoordinator:
             :, req_pool_indices, self.device_buffer_size
         ] = reserved_buffer_loc.to(torch.int32)
 
-        # alloc_decode() wrote a hisparse_attn_allocator slot into the mapping
-        # for this decode step's new token.  That slot is no longer needed:
-        # the token's KV lives in the device buffer (reserved_buffer_loc) which
-        # is tracked separately via req_to_device_buffer / request_finished.
-        # Free the hisparse_attn_allocator slot now, then zero the mapping entry.
-        # We must NOT write reserved_buffer_loc into the mapping because:
-        #   a) free_hisparse() would try to return it to hisparse_attn_allocator
-        #      (wrong allocator → available_size overflow assert), and
-        #   b) device buffer lifetime is managed by request_finished() directly.
-        prior_hisparse_index = (
-            self.mem_pool_device.full_to_hisparse_device_index_mapping[out_cache_loc]
+        # Map the new decode token's logical slot to its device-buffer slot so
+        # that set_mla_kv_buffer() / translate_loc_to_hisparse_device() finds
+        # the right address during the forward pass.
+        # Device buffer lifetime (reserved_buffer_loc) is managed separately by
+        # request_finished() via req_to_device_buffer; free_hisparse() will see
+        # these values and skip them because request_finished() zeros the mapping
+        # before release_kv_cache() calls free().
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[out_cache_loc] = (
+            reserved_buffer_loc
         )
-        self.token_to_kv_pool_allocator.free_hisparse_indices(prior_hisparse_index)
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[out_cache_loc] = 0
 
     def _eager_backup_previous_token(
         self,

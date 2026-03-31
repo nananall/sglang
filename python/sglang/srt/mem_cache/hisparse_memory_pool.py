@@ -311,22 +311,17 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
+        # Only allocate logical indices here.  The mapping for the new decode
+        # token slot is written by map_last_loc_to_buffer() (called before the
+        # forward pass in prepare_for_decode) which maps out_cache_loc to the
+        # reserved device-buffer slot (reserved_buffer_loc).  By the time
+        # set_mla_kv_buffer() runs, the mapping is already set correctly.
+        # Allocating a hisparse_attn_allocator slot here and immediately freeing
+        # it in map_last_loc_to_buffer() serves no purpose and risks accounting
+        # errors (available_size overflow assert).
         logical_indices = self.logical_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
         )
-
-        hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
-        hisparse_indices = self.hisparse_attn_allocator.alloc_decode(
-            seq_lens,
-            seq_lens_cpu,
-            hisparse_last_loc,
-        )
-
-        if logical_indices is None or hisparse_indices is None:
-            return None
-
-        self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
-
         return logical_indices
 
     def free_hisparse(self, free_indices: torch.Tensor):
