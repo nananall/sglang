@@ -699,10 +699,15 @@ class Indexer(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        assert forward_batch.forward_mode.is_extend_without_speculative()
+        assert (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.forward_mode.is_decode()
+        )
         x_meta = x[0] if isinstance(x, tuple) else x
 
-        # Fast path: only compute and store k cache, skip all q and weights ops
+        # Fast path: only compute and store k cache, skip all q and weights ops.
+        # This is also used by HiSparse direct-admit on the first decode step,
+        # before historical NSA index_k state becomes trustworthy.
         key = self._get_k_bf16(x, positions, enable_dual_stream)
 
         if not forward_batch.out_cache_loc.is_contiguous():
@@ -1049,6 +1054,27 @@ class Indexer(MultiPlatformOp):
         # skip NSA if attention backend choose to skip this batch
         if metadata is None:
             return None
+
+        if (
+            forward_batch.forward_mode.is_decode()
+            and forward_batch.hisparse_coordinator is not None
+            and forward_batch.hisparse_coordinator.should_force_nsa_k_only(
+                forward_batch.req_pool_indices
+            )
+        ):
+            # HiSparse direct-admit does not have reliable historical index_k
+            # state on its first decode step. Use the k-only fallback to write
+            # fresh index_k for the current token and return a safe fallback top-k.
+            return self._forward_cuda_k_only(
+                x,
+                positions,
+                forward_batch,
+                layer_id,
+                act_quant,
+                enable_dual_stream,
+                metadata,
+                return_indices,
+            )
 
         # Determine if should skip topk based on sequence length
         # We can only skip the logits computation if cuda graph is not involved

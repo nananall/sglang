@@ -119,6 +119,10 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_reqs
+        # Direct-admit requests do not have trustworthy historical NSA top-k
+        # state on their first decode step. Keep them on a k-only warmup path
+        # until one decode forward finishes and writes fresh index_k entries.
+        self._needs_nsa_k_only_warmup = [False] * max_num_reqs
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -201,6 +205,7 @@ class HiSparseCoordinator:
 
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
+        self._needs_nsa_k_only_warmup[req.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
     def _preload_to_device_buffer(self, req: Req) -> None:
@@ -257,6 +262,20 @@ class HiSparseCoordinator:
 
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
+
+    def should_force_nsa_k_only(self, req_pool_indices: torch.Tensor) -> bool:
+        """Return True if any request in the batch still needs direct-admit warmup."""
+        req_pool_indices_cpu = req_pool_indices.to(device="cpu")
+        return any(
+            self._needs_nsa_k_only_warmup[int(req_idx)]
+            for req_idx in req_pool_indices_cpu.tolist()
+        )
+
+    def finish_nsa_k_only_warmup(self, req_pool_indices: torch.Tensor) -> None:
+        """Clear direct-admit warmup after a decode forward finishes successfully."""
+        req_pool_indices_cpu = req_pool_indices.to(device="cpu")
+        for req_idx in req_pool_indices_cpu.tolist():
+            self._needs_nsa_k_only_warmup[int(req_idx)] = False
 
     def collect_ready_reqs(self) -> list[Req]:
         ready_reqs = []
@@ -570,6 +589,7 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
+        self._needs_nsa_k_only_warmup[req.req_pool_idx] = False
         req.staging = False
 
     def release_host_pool_for_req(self, req: Req) -> None:
@@ -584,6 +604,7 @@ class HiSparseCoordinator:
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
+        self._needs_nsa_k_only_warmup[req.req_pool_idx] = False
 
     def retract_req(self, req: Req) -> None:
         if req.staging:
@@ -620,6 +641,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._needs_nsa_k_only_warmup[req.req_pool_idx] = False
 
     def swap_in_selected_pages(
         self,

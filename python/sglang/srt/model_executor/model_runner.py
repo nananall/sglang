@@ -2500,6 +2500,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
+    def _finish_hisparse_decode_warmup(self, forward_batch: ForwardBatch) -> None:
+        if self.hisparse_coordinator is None or not forward_batch.forward_mode.is_decode():
+            return
+
+        req_pool_indices = forward_batch.req_pool_indices[: forward_batch.batch_size]
+        if req_pool_indices.numel() == 0:
+            return
+
+        self.hisparse_coordinator.finish_nsa_k_only_warmup(req_pool_indices)
+
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
@@ -2687,6 +2697,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            self._finish_hisparse_decode_warmup(forward_batch)
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
@@ -2742,6 +2753,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.pp_group.is_last_rank
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
+
+        self._finish_hisparse_decode_warmup(forward_batch)
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
