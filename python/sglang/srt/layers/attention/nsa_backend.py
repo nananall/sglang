@@ -1693,7 +1693,9 @@ class NativeSparseAttnBackend(
             q_input = q_all
 
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
-        indices_input = page_table_1.unsqueeze(1)
+        indices_input = self._sanitize_flashmla_page_table(
+            page_table_1, kv_cache
+        ).unsqueeze(1)
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_input,
@@ -1732,7 +1734,9 @@ class NativeSparseAttnBackend(
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
-        indices = page_table_1.unsqueeze(1)
+        indices = self._sanitize_flashmla_page_table(page_table_1, kv_cache).unsqueeze(
+            1
+        )
         assert (
             indices.shape[-1] == self.nsa_index_topk
         )  # requirement of FlashMLA decode kernel
@@ -1753,6 +1757,19 @@ class NativeSparseAttnBackend(
             is_fp8_kvcache=True,
         )
         return o
+
+    def _sanitize_flashmla_page_table(
+        self, page_table_1: torch.Tensor, kv_cache: torch.Tensor
+    ) -> torch.Tensor:
+        """Clamp FlashMLA page-table indices to a valid block range.
+
+        HiSparse/direct-admit recovery paths may still leave a few unresolved
+        entries as `-1`, and any stale oversized block index would cause
+        FlashMLA decode/sparse kernels to read out of bounds. Clamp everything
+        into the valid block range before launching the kernel.
+        """
+        max_block_idx = max(kv_cache.shape[0] // self.real_page_size - 1, 0)
+        return page_table_1.clamp(min=0, max=max_block_idx)
 
     def _forward_standard_mha(
         self,
