@@ -1775,7 +1775,9 @@ class NativeSparseAttnBackend(
             # flashmla_sparse keeps cache flat in token-slot layout.
             num_blocks = kv_cache.shape[0] // self.real_page_size
         max_block_idx = max(num_blocks - 1, 0)
-        return page_table_1.clamp(min=0, max=max_block_idx)
+        # Keep -1 (padding / invalid top-k slot) intact so kernel masking works.
+        # Only clamp values that are strictly out of the valid block range.
+        return page_table_1.clamp(min=-1, max=max_block_idx)
 
     def _forward_standard_mha(
         self,
