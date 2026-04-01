@@ -208,11 +208,10 @@ class HiSparseCoordinator:
             # Long sequence: warm up the hot buffer with the most recent prompt
             # tokens so the first decode step can stay on a safe all-hit path.
             self._preload_recent_prompt_window(req)
-            # Use the naive swap-in for a small number of initial decode steps
-            # to let the LRU hot-buffer stabilise after direct-admit.
-            # Bug 1 (miss_token >= host_stride kernel OOB) is now fixed in
-            # hisparse.cuh, so the JIT fast path is safe for long sequences.
-            self._naive_swap_in_steps[req.req_pool_idx] = 2
+            # Bug 1 (miss_token >= host_stride OOB) and Bug 2 (uninitialized
+            # s_lru_slots_out shared memory) are both fixed in hisparse.cuh.
+            # The JIT fast path is safe immediately after direct-admit.
+            self._naive_swap_in_steps[req.req_pool_idx] = 0
 
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
