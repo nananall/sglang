@@ -523,13 +523,17 @@ class HiSparseCoordinator:
 
         host_locs = self.mem_pool_host.alloc(len(device_locs))
         if host_locs is None:
-            logger.error(
-                "HiSparse: host mem pool alloc failed for %d decode backup tokens",
+            # Host pool temporarily exhausted; skip this decode backup.
+            # The host slot for this token will remain uninitialized (-1), which
+            # the swap-in kernel guards against (src_loc < 0 → skip copy).
+            # The token will not be retrievable from host on future decode steps,
+            # but will be correctly re-backed-up on the following step.
+            logger.warning(
+                "HiSparse: host pool full, skipping decode backup for %d tokens; "
+                "affected reqs may have stale host KV for one step.",
                 len(device_locs),
             )
-            raise RuntimeError(
-                f"HiSparse host mem pool alloc failed for {len(device_locs)} decode backup tokens"
-            )
+            return
         host_locs = host_locs.to(device=self.device)
         self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
 
@@ -715,6 +719,15 @@ class HiSparseCoordinator:
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
+
+        # Wait for any in-flight async decode backup to complete before freeing
+        # host memory.  The backup stream issues DMA reads from host_locs; if we
+        # free those slots before the DMA finishes, a subsequent _pre_alloc for a
+        # new request may reallocate them for RDMA, causing concurrent reads
+        # (backup DMA) and writes (RDMA transfer) on the same host memory.
+        if self.pending_decode_backup_event is not None:
+            self.pending_decode_backup_event.synchronize()
+            self.pending_decode_backup_event = None
 
         # release memory — only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
