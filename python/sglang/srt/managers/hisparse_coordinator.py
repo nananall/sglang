@@ -208,12 +208,11 @@ class HiSparseCoordinator:
             # Long sequence: warm up the hot buffer with the most recent prompt
             # tokens so the first decode step can stay on a safe all-hit path.
             self._preload_recent_prompt_window(req)
-            # Use the naive swap-in path for long-seq direct-admit requests.
-            # The JIT kernel has an unresolved OOB on long sequences after
-            # direct-admit; keep naive path until the root cause is fixed.
-            # TODO: investigate load_cache_to_device_buffer OOB on long seq
-            # and lower this value once the kernel is safe.
-            self._naive_swap_in_steps[req.req_pool_idx] = 9999
+            # Use the naive swap-in for a small number of initial decode steps
+            # to let the LRU hot-buffer stabilise after direct-admit.
+            # Bug 1 (miss_token >= host_stride kernel OOB) is now fixed in
+            # hisparse.cuh, so the JIT fast path is safe for long sequences.
+            self._naive_swap_in_steps[req.req_pool_idx] = 2
 
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
@@ -270,6 +269,24 @@ class HiSparseCoordinator:
         self.req_device_buffer_tokens[
             :, req.req_pool_idx, :preload_n
         ] = warm_tokens.view(1, -1)
+
+        # Update lru_slots so that the preloaded (warm) slots are treated as MRU
+        # and empty slots are treated as LRU (evictable first).
+        # Layout: [empty_slots (LRU) ... warm_slots (MRU)]
+        # empty: slots preload_n..device_buffer_size-1 → front of lru_slots
+        # warm:  slots 0..preload_n-1                  → back of lru_slots
+        empty_count = self.device_buffer_size - preload_n
+        new_lru = torch.empty(
+            self.device_buffer_size, dtype=torch.int16, device=self.device
+        )
+        if empty_count > 0:
+            new_lru[:empty_count] = torch.arange(
+                preload_n, self.device_buffer_size, dtype=torch.int16, device=self.device
+            )
+        new_lru[empty_count:] = torch.arange(
+            preload_n, dtype=torch.int16, device=self.device
+        )
+        self.lru_slots[:, req.req_pool_idx, :] = new_lru.unsqueeze(0)
 
     def alloc_device_buffer(self, req: Req) -> None:
         allocated_indices = self.req_to_token_pool.req_to_token[
@@ -589,7 +606,8 @@ class HiSparseCoordinator:
             device_indices = torch.full(
                 (top_n,), -1, dtype=torch.int64, device=self.device
             )
-            valid_mask = (selected_tokens >= 0) & (selected_tokens < seq_len)
+            max_ctx = self.req_to_host_pool.shape[1]
+            valid_mask = (selected_tokens >= 0) & (selected_tokens < seq_len) & (selected_tokens < max_ctx)
             if not torch.any(valid_mask):
                 top_k_indices[i, :top_n] = device_indices.to(torch.int32)
                 continue

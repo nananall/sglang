@@ -331,6 +331,11 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
 
     if (miss_token < 0 || miss_token >= seq_len) continue;
+    // Guard against host_cache_locs stride boundary: req_to_host_pool is
+    // allocated with shape (max_num_reqs, max_context_len). If seq_len exceeds
+    // max_context_len the token position would read past the row boundary and
+    // cause cudaErrorIllegalAddress. Skip those tokens instead.
+    if (miss_token >= static_cast<int32_t>(host_stride)) continue;
     const int64_t src_loc = req_host_cache_locs[miss_token];
     // Guard: skip copy when host slot is uninitialized (-1). This can happen in
     // the PD direct-to-host path where index_k_with_scale_buffer starts as zeros
