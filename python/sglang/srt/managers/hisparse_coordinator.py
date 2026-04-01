@@ -242,15 +242,19 @@ class HiSparseCoordinator:
         stressing the long-sequence miss path before the decode-side hot buffer has
         been populated once.
         """
-        preload_n = min(self.top_k - 1, self.device_buffer_size, req.kv_allocated_len)
+        max_context_len = self.req_to_host_pool.shape[1]
+        # Clamp kv_allocated_len to max_context_len to prevent req_to_host_pool
+        # row boundary overrun when the request is longer than max_context_len.
+        safe_kv_len = min(req.kv_allocated_len, max_context_len)
+        preload_n = min(self.top_k - 1, self.device_buffer_size, safe_kv_len)
         self.req_device_buffer_tokens[
             :, req.req_pool_idx, : self.device_buffer_size
         ] = -1
         if preload_n <= 0:
             return
 
-        start_pos = req.kv_allocated_len - preload_n
-        end_pos = req.kv_allocated_len
+        start_pos = safe_kv_len - preload_n
+        end_pos = safe_kv_len
         host_indices = self.req_to_host_pool[req.req_pool_idx, start_pos:end_pos]
         device_locs = self.req_to_device_buffer[req.req_pool_idx, :preload_n]
 
