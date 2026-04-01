@@ -32,6 +32,12 @@ _HISPARSE_DEBUG_SYNC = os.getenv("SGLANG_HISPARSE_DEBUG_SYNC", "false").lower() 
 _HISPARSE_DEBUG_CHECKS = os.getenv(
     "SGLANG_HISPARSE_DEBUG_CHECKS", "false"
 ).lower() in ("true", "1", "yes", "y")
+_HISPARSE_FORCE_NAIVE_SWAPIN = os.getenv(
+    "SGLANG_HISPARSE_FORCE_NAIVE_SWAPIN", "false"
+).lower() in ("true", "1", "yes", "y")
+_HISPARSE_DISABLE_ASYNC_BACKUP = os.getenv(
+    "SGLANG_HISPARSE_DISABLE_ASYNC_BACKUP", "false"
+).lower() in ("true", "1", "yes", "y")
 
 
 class HiSparseAct(NamedTuple):
@@ -582,26 +588,36 @@ class HiSparseCoordinator:
         # copy does not block the main forward stream.
         current_stream = device_module.current_stream()
         finish_event = device_module.Event()
-        with device_module.stream(self.decode_backup_stream):
-            self.decode_backup_stream.wait_stream(current_stream)
-            if self.decode_producer_stream is not None:
-                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+        if _HISPARSE_DISABLE_ASYNC_BACKUP:
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
                 host_locs,
                 device_locs_contig,
                 io_backend="kernel",
             )
-            finish_event.record()
-            if host_locs.is_cuda:
-                host_locs.record_stream(self.decode_backup_stream)
-            if device_locs_contig.is_cuda:
-                device_locs_contig.record_stream(self.decode_backup_stream)
-            # backup_req_indices is a temporary GPU tensor; keep it alive
-            # until the backup stream finishes to prevent early deallocation.
-            if backup_req_indices.is_cuda:
-                backup_req_indices.record_stream(self.decode_backup_stream)
+            finish_event.record(current_stream)
+        else:
+            with device_module.stream(self.decode_backup_stream):
+                self.decode_backup_stream.wait_stream(current_stream)
+                if self.decode_producer_stream is not None:
+                    self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_locs,
+                    device_locs_contig,
+                    io_backend="kernel",
+                )
+                finish_event.record()
+                if host_locs.is_cuda:
+                    host_locs.record_stream(self.decode_backup_stream)
+                if device_locs_contig.is_cuda:
+                    device_locs_contig.record_stream(self.decode_backup_stream)
+                # backup_req_indices is a temporary GPU tensor; keep it alive
+                # until the backup stream finishes to prevent early deallocation.
+                if backup_req_indices.is_cuda:
+                    backup_req_indices.record_stream(self.decode_backup_stream)
         self.pending_decode_backup_event = finish_event
+
 
     def get_front_topk_tokens(
         self,
@@ -822,7 +838,9 @@ class HiSparseCoordinator:
         # Use CPU copy of req_pool_indices to avoid GPU sync in the hot path.
         # Decrement only on layer_id==0 so each decode step counts once.
         req_pool_indices_cpu = req_pool_indices.tolist()
-        has_naive = any(self._naive_swap_in_steps[idx] > 0 for idx in req_pool_indices_cpu)
+        has_naive = _HISPARSE_FORCE_NAIVE_SWAPIN or any(
+            self._naive_swap_in_steps[idx] > 0 for idx in req_pool_indices_cpu
+        )
         if has_naive:
             if layer_id == 0:
                 for idx in req_pool_indices_cpu:
