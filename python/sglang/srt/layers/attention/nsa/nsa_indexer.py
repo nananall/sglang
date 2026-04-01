@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -17,6 +18,10 @@ from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+
+_DISABLE_FUSED_INDEX_K_STORE = os.getenv(
+    "SGLANG_HISPARSE_DISABLE_FUSED_INDEX_K_STORE", "false"
+).lower() in ("true", "1", "yes", "y")
 
 global _use_multi_stream
 _is_cuda = is_cuda()
@@ -1012,7 +1017,8 @@ class Indexer(MultiPlatformOp):
 
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
         if (
-            _is_cuda
+            (not _DISABLE_FUSED_INDEX_K_STORE)
+            and _is_cuda
             and (not _is_fp8_fnuz)
             and can_use_nsa_fused_store(
                 key.dtype,

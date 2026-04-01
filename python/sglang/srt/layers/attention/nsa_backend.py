@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
@@ -36,7 +37,12 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import get_device_module, is_cuda, is_hip
+
+_device_module = get_device_module()
+_HISPARSE_SYNC_AFTER_SET_MLA_KV = os.getenv(
+    "SGLANG_HISPARSE_SYNC_AFTER_SET_MLA_KV", "false"
+).lower() in ("true", "1", "yes", "y")
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -1313,6 +1319,8 @@ class NativeSparseAttnBackend(
                     k,
                     k_rope,
                 )
+                if _HISPARSE_SYNC_AFTER_SET_MLA_KV:
+                    _device_module.current_stream().synchronize()
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
