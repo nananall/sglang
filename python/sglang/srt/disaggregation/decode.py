@@ -680,6 +680,10 @@ class DecodePreallocQueue:
 
             allocatable_tokens -= required_tokens_for_request
             dst_kv_indices = self._pre_alloc(decode_req.req)
+            if dst_kv_indices is None:
+                # Host pool full (HiSparse) or logical pool exhausted; stop
+                # preallocating and wait for running requests to finish first.
+                break
 
             origin_input_len = len(decode_req.req.origin_input_ids)
             if self.scheduler.enable_hisparse:
@@ -789,8 +793,15 @@ class DecodePreallocQueue:
         )
 
         if isinstance(self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
-            available_size = (
-                self.token_to_kv_pool_allocator.logical_available_size()
+            # For HiSparse, the effective available size is the minimum of:
+            #   - logical pool (index bookkeeping for req_to_token)
+            #   - host pool (actual KV storage for RDMA destination)
+            # hisparse_attn_allocator (hot buffer) is excluded because it is
+            # only allocated in admit_request_direct(), after transfer completes.
+            coordinator = self.scheduler.hisparse_coordinator
+            available_size = min(
+                self.token_to_kv_pool_allocator.logical_available_size(),
+                coordinator.mem_pool_host.available_size(),
             )
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
@@ -865,10 +876,15 @@ class DecodePreallocQueue:
             # Allocate host indices for the RDMA transfer target
             host_indices = coordinator.mem_pool_host.alloc(fill_len)
             if host_indices is None:
-                raise RuntimeError(
-                    f"HiSparse host mem pool alloc failed for {fill_len} tokens "
-                    f"in _pre_alloc (req {req.rid})"
+                # Host pool is full; roll back the logical alloc and req_pool slot
+                # so the caller can break gracefully.
+                self.token_to_kv_pool_allocator.free(
+                    self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :fill_len
+                    ].clone()
                 )
+                self.req_to_token_pool.free(req)
+                return None
             host_indices = host_indices.to(device=coordinator.device)
             coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
         elif self.token_to_kv_pool_allocator.page_size == 1:
