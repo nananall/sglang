@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+import os
 from collections import deque
 from typing import NamedTuple
 
@@ -20,6 +21,17 @@ device_module = get_device_module()
 _is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
+
+
+_HISPARSE_DEBUG_SYNC = os.getenv("SGLANG_HISPARSE_DEBUG_SYNC", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+    "y",
+)
+_HISPARSE_DEBUG_CHECKS = os.getenv(
+    "SGLANG_HISPARSE_DEBUG_CHECKS", "false"
+).lower() in ("true", "1", "yes", "y")
 
 
 class HiSparseAct(NamedTuple):
@@ -504,6 +516,14 @@ class HiSparseCoordinator:
             if self._skip_first_backup[req_idx]:
                 self._skip_first_backup[req_idx] = False
                 continue
+            if int(seq_lens_cpu[i]) < 2:
+                if _HISPARSE_DEBUG_CHECKS:
+                    logger.warning(
+                        "HiSparse debug: skip decode backup for req_idx=%d with seq_len=%d",
+                        req_idx,
+                        int(seq_lens_cpu[i]),
+                    )
+                continue
             backup_indices.append(i)
 
         if not backup_indices:
@@ -516,10 +536,23 @@ class HiSparseCoordinator:
         #  - short seq: slot = seq_len - 2  (within the regular buffer)
         #  - long seq:  slot = device_buffer_size  (the reserved slot)
         actual_token_pos = seq_lens[backup_indices_gpu] - 2
-        buffer_slot = actual_token_pos.clamp(max=self.device_buffer_size)
+        buffer_slot = actual_token_pos.clamp(min=0, max=self.device_buffer_size)
 
         backup_req_indices = req_pool_indices[backup_indices_gpu]
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
+        if _HISPARSE_DEBUG_CHECKS:
+            if torch.any(actual_token_pos < 0):
+                bad_positions = actual_token_pos[actual_token_pos < 0]
+                raise RuntimeError(
+                    f"HiSparse debug: negative actual_token_pos in decode backup: {bad_positions.tolist()}"
+                )
+            if torch.any(device_locs < 0) or torch.any(device_locs >= self.mem_pool_device.size):
+                bad_locs = device_locs[
+                    (device_locs < 0) | (device_locs >= self.mem_pool_device.size)
+                ]
+                raise RuntimeError(
+                    f"HiSparse debug: invalid device_locs in decode backup: {bad_locs.tolist()}"
+                )
 
         host_locs = self.mem_pool_host.alloc(len(device_locs))
         if host_locs is None:
@@ -805,10 +838,25 @@ class HiSparseCoordinator:
         if self.pending_decode_backup_event is not None:
             device_module.current_stream().wait_event(self.pending_decode_backup_event)
             self.pending_decode_backup_event = None
+        if _HISPARSE_DEBUG_SYNC:
+            device_module.current_stream().synchronize()
 
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
+        if _HISPARSE_DEBUG_CHECKS:
+            if torch.any(req_pool_indices < 0) or torch.any(req_pool_indices >= self.req_to_device_buffer.shape[0]):
+                bad_req_idx = req_pool_indices[
+                    (req_pool_indices < 0)
+                    | (req_pool_indices >= self.req_to_device_buffer.shape[0])
+                ]
+                raise RuntimeError(
+                    f"HiSparse debug: invalid req_pool_indices before swap-in: {bad_req_idx.tolist()}"
+                )
+            if torch.any(seq_lens < 0):
+                raise RuntimeError(
+                    f"HiSparse debug: negative seq_lens before swap-in: {seq_lens.tolist()}"
+                )
         # todo, adjustable for performance
         block_size = 1024
         load_cache_to_device_buffer_mla(
