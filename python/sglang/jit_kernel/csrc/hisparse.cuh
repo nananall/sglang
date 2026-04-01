@@ -148,6 +148,12 @@ __global__ void load_cache_to_device_buffer_kernel(
     s_chunk_offset[i] = 0;
     s_evict_chunk_offset[i] = 0;
   }
+  // Initialize lru_slots_out to -1 so that any slot not written by Pass 2
+  // (i.e. when total_evict_count < total_misses) is safely detectable as
+  // invalid in Pass 4 via the evict_slot < 0 guard.
+  for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
+    s_lru_slots_out[i] = -1;
+  }
   __syncthreads();
 
   const int newest_slot = HOT_BUFFER_SIZE;
@@ -343,6 +349,11 @@ __global__ void load_cache_to_device_buffer_kernel(
     // present. In that case we leave the miss unresolved (device loc stays -1 and
     // the evict slot metadata is unchanged) instead of returning stale KV as valid.
     if (src_loc < 0) continue;
+    // Guard: evict_slot may be uninitialized if total_misses > total_evict_count
+    // (can happen when the device buffer is not fully populated, e.g. direct-admit
+    // with preload_n < HOT_BUFFER_SIZE). Reading req_device_buffer_locs with a
+    // garbage evict_slot causes cudaErrorIllegalAddress.
+    if (evict_slot < 0 || evict_slot >= HOT_BUFFER_SIZE) continue;
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
 
     const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
