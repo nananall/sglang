@@ -130,9 +130,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: NSATokenToKVPool,
         need_sort: bool,
         host_to_device_ratio: int = 2,
+        logical_size: Optional[int] = None,
     ):
         self._kvcache = kvcache
-        self._size_full = size * host_to_device_ratio
+        # logical_size controls how many KV indices can be tracked simultaneously
+        # for all in-flight requests (prealloced + transfer + running).
+        # In PD disaggregation decode mode the transfer queue can hold many
+        # long-sequence requests whose logical tokens must be indexed even before
+        # the hisparse device buffer is allocated (alloc_logical_only path).
+        # Caller should pass logical_size = max_running_requests * max_context_len
+        # when this allocator is used for PD decode; defaults to size * host_to_device_ratio
+        # for backward compatibility with non-PD (prefill) usage.
+        self._size_full = logical_size if logical_size is not None else size * host_to_device_ratio
         self._size_hisparse = size
         self.dtype = dtype
         self.device = device
@@ -187,6 +196,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.available_size(),
             self.hisparse_attn_allocator.available_size(),
         )
+
+    def logical_available_size(self) -> int:
+        """Return available logical token slots (ignoring hisparse device pool).
+
+        Used by the PD disaggregation prealloc gating for HiSparse decode mode.
+        In this path, KV data is stored in the host pool and the hisparse device
+        buffer is only allocated later (in admit_request_direct), so gating on
+        hisparse_attn_allocator.available_size() would artificially cap the
+        number of in-flight transfer-queue requests to ~device_pool / seq_len
+        instead of ~host_pool / seq_len.
+        """
+        return self.logical_attn_allocator.available_size()
 
     def alloc(self, need_size: int):
         raise NotImplementedError(

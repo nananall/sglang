@@ -733,6 +733,29 @@ class ModelRunnerKVCacheMixin:
                         )
 
                         hisparse_cfg = parse_hisparse_config(self.server_args)
+                        # For PD disaggregation decode, the logical pool must hold
+                        # logical KV indices for all concurrently in-flight requests
+                        # (transfer queue + running batch).  Size it as
+                        # max_running_requests * max_context_len so it never becomes
+                        # the binding constraint before the host pool fills up.
+                        is_pd_decode = (
+                            getattr(self.server_args, "disaggregation_mode", None)
+                            == "decode"
+                        )
+                        if is_pd_decode:
+                            logical_size = (
+                                self.max_running_requests
+                                * self.model_config.context_len
+                            )
+                            # Round down to page alignment
+                            logical_size = (logical_size // self.page_size) * self.page_size
+                            # Must be at least as large as the host_to_device_ratio default
+                            logical_size = max(
+                                logical_size,
+                                self.max_total_num_tokens * hisparse_cfg.host_to_device_ratio,
+                            )
+                        else:
+                            logical_size = None  # use default (size * host_to_device_ratio)
                         self.token_to_kv_pool_allocator = (
                             HiSparseTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,
@@ -742,6 +765,7 @@ class ModelRunnerKVCacheMixin:
                                 kvcache=self.token_to_kv_pool,
                                 need_sort=need_sort,
                                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                                logical_size=logical_size,
                             )
                         )
                     elif self.page_size == 1:

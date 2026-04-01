@@ -776,7 +776,24 @@ class DecodePreallocQueue:
             and len(self.scheduler.running_batch.reqs) > 0
             else 0
         )
-        available_size = self.token_to_kv_pool_allocator.available_size()
+        # For HiSparse PD decode, gate pre-alloc on the logical pool only.
+        # available_size() = min(logical, hisparse_device) which caps at
+        # hisparse_device_size (~max_total_num_tokens), severely limiting
+        # concurrent transfer-queue requests.  The hisparse device buffer is
+        # only allocated in admit_request_direct() (after transfer completes),
+        # so it must not constrain how many requests can be pre-allocated.
+        # The host pool holds the actual KV data and is the real limit; its
+        # capacity is checked implicitly (alloc failure) in _pre_alloc.
+        from sglang.srt.mem_cache.hisparse_memory_pool import (
+            HiSparseTokenToKVPoolAllocator,
+        )
+
+        if isinstance(self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+            available_size = (
+                self.token_to_kv_pool_allocator.logical_available_size()
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
         allocatable_tokens = available_size - max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
