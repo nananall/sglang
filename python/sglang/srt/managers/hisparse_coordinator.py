@@ -38,6 +38,9 @@ _HISPARSE_FORCE_NAIVE_SWAPIN = os.getenv(
 _HISPARSE_DISABLE_ASYNC_BACKUP = os.getenv(
     "SGLANG_HISPARSE_DISABLE_ASYNC_BACKUP", "false"
 ).lower() in ("true", "1", "yes", "y")
+_HISPARSE_DISABLE_DECODE_BACKUP = os.getenv(
+    "SGLANG_HISPARSE_DISABLE_DECODE_BACKUP", "false"
+).lower() in ("true", "1", "yes", "y")
 
 
 class HiSparseAct(NamedTuple):
@@ -516,6 +519,8 @@ class HiSparseCoordinator:
         """
         # Build the list of batch positions that need a host backup.
         # Skip the first decode step after staging (prefill already backed up).
+        if _HISPARSE_DISABLE_DECODE_BACKUP:
+            return
         backup_indices = []
         for i in range(len(seq_lens_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
@@ -835,12 +840,20 @@ class HiSparseCoordinator:
                 f"top_k_result dtype {top_k_result.dtype} is not int32 as expected"
             )
         # Check if any request still has remaining naive-swap-in steps.
-        # Use CPU copy of req_pool_indices to avoid GPU sync in the hot path.
         # Decrement only on layer_id==0 so each decode step counts once.
+        if _HISPARSE_FORCE_NAIVE_SWAPIN:
+            return self.naive_load_topk(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                top_k_tokens=top_k_result,
+                layer_id=layer_id,
+            )
+
+        # Use CPU copy of req_pool_indices only after the force-naive early return,
+        # otherwise the .tolist() sync point would still surface deferred CUDA
+        # errors and defeat the purpose of isolating the JIT swap-in kernel.
         req_pool_indices_cpu = req_pool_indices.tolist()
-        has_naive = _HISPARSE_FORCE_NAIVE_SWAPIN or any(
-            self._naive_swap_in_steps[idx] > 0 for idx in req_pool_indices_cpu
-        )
+        has_naive = any(self._naive_swap_in_steps[idx] > 0 for idx in req_pool_indices_cpu)
         if has_naive:
             if layer_id == 0:
                 for idx in req_pool_indices_cpu:
