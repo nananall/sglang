@@ -537,6 +537,14 @@ class HiSparseCoordinator:
         host_locs = host_locs.to(device=self.device)
         self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
 
+        # Make device_locs contiguous *before* entering the backup stream context so
+        # that the contiguous copy (new buffer) is created on the main stream and can
+        # be correctly protected with record_stream below.  If we called
+        # device_locs.contiguous() inside the `with` block, the new tensor would go
+        # out of scope at block exit and PyTorch's caching allocator might reuse its
+        # memory on the main stream before decode_backup_stream finishes reading it.
+        device_locs_contig = device_locs.contiguous()
+
         # Issue the backup asynchronously on a dedicated stream so the host→device
         # copy does not block the main forward stream.
         current_stream = device_module.current_stream()
@@ -548,14 +556,14 @@ class HiSparseCoordinator:
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
                 host_locs,
-                device_locs.contiguous(),
+                device_locs_contig,
                 io_backend="kernel",
             )
             finish_event.record()
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
-            if device_locs.is_cuda:
-                device_locs.record_stream(self.decode_backup_stream)
+            if device_locs_contig.is_cuda:
+                device_locs_contig.record_stream(self.decode_backup_stream)
             # backup_req_indices is a temporary GPU tensor; keep it alive
             # until the backup stream finishes to prevent early deallocation.
             if backup_req_indices.is_cuda:
