@@ -1879,6 +1879,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
+    def check_decode_host_mem(self, selected_indices: Optional[List[int]] = None):
+        if self.hisparse_coordinator is None:
+            return True
+
+        reqs = (
+            self.reqs
+            if selected_indices is None
+            else [self.reqs[i] for i in selected_indices]
+        )
+        return self.hisparse_coordinator.can_backup_decode_tokens(reqs)
+
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
         for idx in range(len(self.reqs)):
@@ -1961,7 +1972,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
 
-        if server_args.disaggregation_mode == "decode":
+        if (
+            server_args.disaggregation_mode == "decode"
+            and not server_args.enable_hisparse
+        ):
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )

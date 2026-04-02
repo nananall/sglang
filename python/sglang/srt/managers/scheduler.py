@@ -2484,9 +2484,55 @@ class Scheduler(
 
         return new_batch
 
+    def _abort_hisparse_decode_reqs_for_oom(
+        self, batch: ScheduleBatch
+    ) -> Tuple[List[Req], float]:
+        """Abort decode requests to recover memory when HiSparse cannot retract."""
+        sorted_indices = list(range(len(batch.reqs)))
+        if not self.server_args.speculative_algorithm:
+            sorted_indices.sort(
+                key=lambda i: (
+                    len(batch.reqs[i].output_ids),
+                    -len(batch.reqs[i].origin_input_ids),
+                ),
+                reverse=True,
+            )
+
+        aborted_reqs: List[Req] = []
+        while sorted_indices and (
+            not batch.check_decode_mem(selected_indices=sorted_indices)
+            or not batch.check_decode_host_mem(selected_indices=sorted_indices)
+        ):
+            idx = sorted_indices.pop()
+            req = batch.reqs[idx]
+            req.to_finish = FINISH_ABORT(
+                "HiSparse PD decode does not support request retraction yet. "
+                "Aborting the request to recover decode memory.",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            self.hisparse_coordinator.request_finished(req)
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            aborted_reqs.append(req)
+
+        batch.filter_batch(keep_indices=sorted_indices)
+
+        total_decoded_tokens = sum(len(r.output_ids) for r in batch.reqs)
+        total_max_new_tokens = sum(
+            r.sampling_params.max_new_tokens for r in batch.reqs
+        )
+        new_estimate_ratio = (
+            total_decoded_tokens
+            + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(batch.reqs)
+        ) / (total_max_new_tokens + 1)
+        new_estimate_ratio = min(1.0, new_estimate_ratio)
+        return aborted_reqs, new_estimate_ratio
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
+        is_hisparse_pd_decode = (
+            self.enable_hisparse and self.server_args.disaggregation_mode == "decode"
+        )
 
         batch.filter_batch(v1_spec_info_filtered=True)
         if batch.is_empty():
@@ -2499,16 +2545,37 @@ class Scheduler(
             self.tree_cache.flush_write_through_acks()
 
         # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        kv_full_retract_flag = not batch.check_decode_mem()
+        hisparse_host_full_flag = (
+            is_hisparse_pd_decode and not batch.check_decode_host_mem()
+        )
+        if kv_full_retract_flag or hisparse_host_full_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
-            old_ratio = self.new_token_ratio
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
+            old_available_host_tokens = (
+                self.hisparse_coordinator.available_host_tokens()
+                if is_hisparse_pd_decode
+                else None
             )
+            old_ratio = self.new_token_ratio
+            if is_hisparse_pd_decode:
+                retracted_reqs = []
+                reqs_to_abort, new_token_ratio = (
+                    self._abort_hisparse_decode_reqs_for_oom(batch)
+                )
+            else:
+                retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+                    self.server_args
+                )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
+            new_host_tokens_gained = (
+                self.hisparse_coordinator.available_host_tokens()
+                - old_available_host_tokens
+                if old_available_host_tokens is not None
+                else None
+            )
 
             self.num_retracted_reqs = len(retracted_reqs)
             if self.enable_metrics and len(retracted_reqs) > 0:
@@ -2532,22 +2599,55 @@ class Scheduler(
                     req,
                 )
 
-            msg_prefix = (
-                "KV cache pool is full. Retract requests. "
-                if kv_full_retract_flag
-                else "Testing retraction. "
-            )
-            msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
-            if kv_full_retract_flag:
-                msg_details += (
-                    f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
+            if is_hisparse_pd_decode:
+                if not kv_full_retract_flag and not hisparse_host_full_flag:
+                    msg_prefix = (
+                        "Testing HiSparse decode recovery path. Abort requests "
+                        "because decode retraction is disabled. "
+                    )
+                elif kv_full_retract_flag and hisparse_host_full_flag:
+                    msg_prefix = (
+                        "Decode KV cache and HiSparse host backup pool are full. "
+                        "Abort requests because HiSparse PD decode retraction "
+                        "is disabled. "
+                    )
+                elif hisparse_host_full_flag:
+                    msg_prefix = (
+                        "HiSparse host backup pool is full. Abort requests "
+                        "because decode retraction is disabled. "
+                    )
+                else:
+                    msg_prefix = (
+                        "KV cache pool is full. Abort requests because "
+                        "HiSparse PD decode retraction is disabled. "
+                    )
+                msg_details = (
+                    f"#aborted_reqs: {len(reqs_to_abort)}, "
+                    f"#new_tokens_gained: {new_token_gained}, "
+                    f"#new_host_tokens_gained: {new_host_tokens_gained}, "
+                    f"#new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
                 )
+            else:
+                msg_prefix = (
+                    "KV cache pool is full. Retract requests. "
+                    if kv_full_retract_flag
+                    else "Testing retraction. "
+                )
+                msg_details = (
+                    f"#retracted_reqs: {len(retracted_reqs)}, "
+                    f"#new_tokens_gained: {new_token_gained}"
+                )
+                if kv_full_retract_flag:
+                    msg_details += (
+                        f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
+                    )
             logger.warning(msg_prefix + msg_details)
 
-            for req in retracted_reqs:
-                self._add_request_to_queue(req, is_retracted=True)
-                if self.enable_hisparse:
-                    self.hisparse_coordinator.retract_req(req)
+            if not is_hisparse_pd_decode:
+                for req in retracted_reqs:
+                    self._add_request_to_queue(req, is_retracted=True)
+                    if self.enable_hisparse:
+                        self.hisparse_coordinator.retract_req(req)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,

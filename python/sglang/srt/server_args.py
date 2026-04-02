@@ -3172,6 +3172,14 @@ class ServerArgs:
         if self.disaggregation_mode == "decode":
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
+            if self.enable_hisparse:
+                if not self.disable_cuda_graph:
+                    logger.warning(
+                        "Cuda graph is disabled for HiSparse PD decode because "
+                        "its decode hot-buffer state is updated dynamically at runtime."
+                    )
+                self.disable_cuda_graph = True
+                self.disable_piecewise_cuda_graph = True
 
         elif self.disaggregation_mode == "prefill":
             assert (

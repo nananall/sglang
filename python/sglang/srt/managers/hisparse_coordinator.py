@@ -157,6 +157,44 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
+    def estimate_device_buffer_tokens(self, kv_allocated_len: int) -> int:
+        if kv_allocated_len <= 0:
+            return 0
+
+        page_size = self.mem_pool_device.page_size
+        alloc_size = min(
+            ((kv_allocated_len + page_size - 1) // page_size) * page_size,
+            self.device_buffer_size,
+        )
+        if alloc_size == self.device_buffer_size:
+            alloc_size = self.padded_buffer_size
+        return alloc_size
+
+    def available_device_buffer_tokens(self) -> int:
+        return self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+
+    def available_host_tokens(self) -> int:
+        return self.mem_pool_host.available_size()
+
+    def decode_backup_tokens_needed(self, reqs: list[Req]) -> int:
+        if _HISPARSE_DISABLE_DECODE_BACKUP:
+            return 0
+
+        needed = 0
+        for req in reqs:
+            req_idx = req.req_pool_idx
+            if req_idx is None or req_idx < 0:
+                continue
+            if self._skip_first_backup[req_idx]:
+                continue
+            if req.kv_allocated_len < 1:
+                continue
+            needed += 1
+        return needed
+
+    def can_backup_decode_tokens(self, reqs: list[Req]) -> bool:
+        return self.available_host_tokens() >= self.decode_backup_tokens_needed(reqs)
+
     def admit_request_into_staging(self, req: Req) -> None:
         req.staging = True
         logical_indices = self.req_to_token_pool.req_to_token[
@@ -233,6 +271,9 @@ class HiSparseCoordinator:
             # s_lru_slots_out shared memory) are both fixed in hisparse.cuh.
             # The JIT fast path is safe immediately after direct-admit.
             self._naive_swap_in_steps[req.req_pool_idx] = 0
+
+        if self.decode_producer_stream is not None:
+            self.decode_producer_stream.wait_stream(device_module.current_stream())
 
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
@@ -567,17 +608,17 @@ class HiSparseCoordinator:
 
         host_locs = self.mem_pool_host.alloc(len(device_locs))
         if host_locs is None:
-            # Host pool temporarily exhausted; skip this decode backup.
-            # The host slot for this token will remain uninitialized (-1), which
-            # the swap-in kernel guards against (src_loc < 0 → skip copy).
-            # The token will not be retrievable from host on future decode steps,
-            # but will be correctly re-backed-up on the following step.
-            logger.warning(
-                "HiSparse: host pool full, skipping decode backup for %d tokens; "
-                "affected reqs may have stale host KV for one step.",
+            logger.error(
+                "HiSparse: host pool exhausted during decode backup "
+                "(need=%d, available=%d). Scheduler should have gated this "
+                "before the batch was launched.",
                 len(device_locs),
+                self.available_host_tokens(),
             )
-            return
+            raise RuntimeError(
+                "HiSparse host pool exhausted during decode backup. "
+                "The batch should have been throttled or aborted earlier."
+            )
         host_locs = host_locs.to(device=self.device)
         self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
 

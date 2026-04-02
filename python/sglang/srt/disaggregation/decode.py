@@ -627,6 +627,20 @@ class DecodePreallocQueue:
         allocatable_tokens = self._allocatable_tokens(
             retractable_tokens=retractable_tokens, count_retracted=True
         )
+        coordinator = self.scheduler.hisparse_coordinator
+        reserved_hot_buffer_tokens = 0
+        if self.scheduler.enable_hisparse:
+            reserved_hot_buffer_tokens = sum(
+                coordinator.estimate_device_buffer_tokens(
+                    decode_req.req.kv_allocated_len
+                    if decode_req.req.kv_allocated_len > 0
+                    else (
+                        len(decode_req.req.origin_input_ids)
+                        + max(len(decode_req.req.output_ids) - 1, 0)
+                    )
+                )
+                for decode_req in self.transfer_queue.queue
+            )
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -678,12 +692,26 @@ class DecodePreallocQueue:
             if required_tokens_for_request > allocatable_tokens:
                 break
 
+            hot_buffer_tokens_needed = 0
+            if self.scheduler.enable_hisparse:
+                fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
+                hot_buffer_tokens_needed = (
+                    coordinator.estimate_device_buffer_tokens(fill_len)
+                )
+                if (
+                    reserved_hot_buffer_tokens + hot_buffer_tokens_needed
+                    > coordinator.available_device_buffer_tokens()
+                ):
+                    break
+
             allocatable_tokens -= required_tokens_for_request
             dst_kv_indices = self._pre_alloc(decode_req.req)
             if dst_kv_indices is None:
                 # Host pool full (HiSparse) or logical pool exhausted; stop
                 # preallocating and wait for running requests to finish first.
                 break
+            if self.scheduler.enable_hisparse:
+                reserved_hot_buffer_tokens += hot_buffer_tokens_needed
 
             origin_input_len = len(decode_req.req.origin_input_ids)
             if self.scheduler.enable_hisparse:
@@ -1281,9 +1309,7 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
-            return
+        should_allocate_new = len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -1294,8 +1320,9 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-            self.disagg_decode_transfer_queue.extend(req_conns)
+            if should_allocate_new:
+                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+                self.disagg_decode_transfer_queue.extend(req_conns)
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived

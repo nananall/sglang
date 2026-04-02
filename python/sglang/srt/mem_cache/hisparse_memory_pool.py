@@ -239,13 +239,25 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
-        # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
-        hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        old_hisparse_indices = self.full_to_hisparse_device_index_mapping[
+            allocated_indices
+        ]
         # Filter valid (non-zero) hisparse indices.
         # In the direct-to-host path, mapping is all zeros since no hisparse
         # device indices were pre-allocated.
-        hisparse_indices = hisparse_indices[hisparse_indices > 0]
+        hisparse_indices = old_hisparse_indices[old_hisparse_indices > 0]
+        padded_existing = len(hisparse_indices)
+        if padded_existing < need_size:
+            page_residual_length = len(hisparse_indices) % self.page_size
+            if page_residual_length != 0:
+                padded_existing += self.page_size - page_residual_length
+            extra_needed = need_size - padded_existing
+            if extra_needed > self.hisparse_attn_allocator.available_size():
+                return None
+
+        # Clear original reference only after the allocation has been shown to
+        # fit, so callers can retry safely instead of losing the old mapping.
+        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
             self.free_hisparse_indices(hisparse_indices[need_size:])
@@ -269,9 +281,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
+            if extra_indices is None:
+                self.full_to_hisparse_device_index_mapping[
+                    allocated_indices
+                ] = old_hisparse_indices
+                return None
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
 
