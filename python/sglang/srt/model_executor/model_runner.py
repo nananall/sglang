@@ -621,26 +621,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             hisparse_cfg = parse_hisparse_config(self.server_args)
-            host_to_device_ratio = hisparse_cfg.host_to_device_ratio
-            size_full = getattr(self.token_to_kv_pool_allocator, "size_full", None)
-            if size_full is not None and self.max_total_num_tokens > 0:
-                host_to_device_ratio = max(
-                    host_to_device_ratio,
-                    size_full / self.max_total_num_tokens,
-                )
-                if self.server_args.disaggregation_mode == "decode":
-                    # Reserve host capacity for both direct-to-host prompt KV and
-                    # future decode-token backups so decode does not silently run
-                    # out of host slots after prompt transfer succeeds.
-                    host_to_device_ratio = max(
-                        host_to_device_ratio,
-                        (
-                            size_full
-                            + self.max_running_requests
-                            * self.server_args.num_reserved_decode_tokens
-                        )
-                        / self.max_total_num_tokens,
-                    )
             self.hisparse_coordinator = HiSparseCoordinator(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -652,7 +632,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     if self.server_args.enable_dp_attention
                     else self.tp_group.cpu_group
                 ),
-                host_to_device_ratio=host_to_device_ratio,
+                # The PD decode logical pool may be much larger than the actual
+                # host KV budget. Keep host memory sizing controlled by the
+                # user-facing HiSparse config and rely on scheduler-side host
+                # gating to avoid decode backup overruns.
+                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             )
 
         # Init routed experts capturer
