@@ -624,8 +624,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             force_naive_swap_in = self.server_args.disaggregation_mode == "decode"
             if force_naive_swap_in:
                 logger.warning(
-                    "HiSparse PD decode is forcing naive swap-in because the "
-                    "JIT swap-in kernel is still unstable under load."
+                    "HiSparse PD decode is forcing the conservative decode "
+                    "path (k-only indexer + naive swap-in) because the "
+                    "optimized sparse decode path is still unstable under load."
                 )
             self.hisparse_coordinator = HiSparseCoordinator(
                 req_to_token_pool=self.req_to_token_pool,

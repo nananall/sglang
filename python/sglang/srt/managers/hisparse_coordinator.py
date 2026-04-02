@@ -393,6 +393,9 @@ class HiSparseCoordinator:
 
     def should_force_nsa_k_only(self, req_pool_indices: torch.Tensor) -> bool:
         """Return True if any request in the batch still needs direct-admit warmup."""
+        if getattr(self, "force_naive_swap_in", False):
+            return True
+
         req_pool_indices_cpu = req_pool_indices.to(device="cpu")
         return any(
             self._nsa_k_only_warmup_steps[int(req_idx)] > 0
@@ -401,6 +404,9 @@ class HiSparseCoordinator:
 
     def finish_nsa_k_only_warmup(self, req_pool_indices: torch.Tensor) -> None:
         """Advance direct-admit warmup after a decode forward finishes successfully."""
+        if getattr(self, "force_naive_swap_in", False):
+            return
+
         req_pool_indices_cpu = req_pool_indices.to(device="cpu")
         for req_idx in req_pool_indices_cpu.tolist():
             req_idx = int(req_idx)
