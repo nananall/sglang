@@ -621,6 +621,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             hisparse_cfg = parse_hisparse_config(self.server_args)
+            force_naive_swap_in = self.server_args.disaggregation_mode == "decode"
+            if force_naive_swap_in:
+                logger.warning(
+                    "HiSparse PD decode is forcing naive swap-in because the "
+                    "JIT swap-in kernel is still unstable under load."
+                )
             self.hisparse_coordinator = HiSparseCoordinator(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -637,6 +643,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # user-facing HiSparse config and rely on scheduler-side host
                 # gating to avoid decode backup overruns.
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                # The HiSparse JIT swap-in kernel is still unstable in PD decode
+                # pressure tests. Use the naive path there until the kernel path
+                # is proven safe end-to-end.
+                force_naive_swap_in=force_naive_swap_in,
             )
 
         # Init routed experts capturer

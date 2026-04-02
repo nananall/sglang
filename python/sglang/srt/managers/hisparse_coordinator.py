@@ -59,12 +59,14 @@ class HiSparseCoordinator:
         device: str,
         tp_group: torch.distributed.ProcessGroup,
         host_to_device_ratio: int = 2,
+        force_naive_swap_in: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
         self.device = device
+        self.force_naive_swap_in = force_naive_swap_in
 
         self.mem_pool_device: HiSparseNSATokenToKVPool = (
             self.token_to_kv_pool_allocator.get_kvcache()
@@ -878,7 +880,7 @@ class HiSparseCoordinator:
             )
         # Check if any request still has remaining naive-swap-in steps.
         # Decrement only on layer_id==0 so each decode step counts once.
-        if _HISPARSE_FORCE_NAIVE_SWAPIN:
+        if _HISPARSE_FORCE_NAIVE_SWAPIN or getattr(self, "force_naive_swap_in", False):
             return self.naive_load_topk(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
