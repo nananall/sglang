@@ -355,6 +355,10 @@ __global__ void load_cache_to_device_buffer_kernel(
     // garbage evict_slot causes cudaErrorIllegalAddress.
     if (evict_slot < 0 || evict_slot >= HOT_BUFFER_SIZE) continue;
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
+    // Guard: an evictable slot may still not have a physical backing location
+    // if the hot buffer metadata is only partially initialized. Skip the miss
+    // instead of issuing a copy to a negative device address.
+    if (dst_loc < 0) continue;
 
     const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
     auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;

@@ -262,15 +262,10 @@ class HiSparseCoordinator:
             # Short sequences: kernel fast path returns device_buffer_locs
             # directly, so we must preload all tokens into the device buffer first.
             self._preload_to_device_buffer(req)
-            self._naive_swap_in_steps[req.req_pool_idx] = 0
         else:
             # Long sequence: warm up the hot buffer with the most recent prompt
             # tokens so the first decode step can stay on a safe all-hit path.
             self._preload_recent_prompt_window(req)
-            # Bug 1 (miss_token >= host_stride OOB) and Bug 2 (uninitialized
-            # s_lru_slots_out shared memory) are both fixed in hisparse.cuh.
-            # The JIT fast path is safe immediately after direct-admit.
-            self._naive_swap_in_steps[req.req_pool_idx] = 0
 
         if self.decode_producer_stream is not None:
             self.decode_producer_stream.wait_stream(device_module.current_stream())
@@ -279,6 +274,7 @@ class HiSparseCoordinator:
         self._skip_first_backup[req.req_pool_idx] = True
         warmup_steps = 2 if req.kv_allocated_len > self.device_buffer_size else 1
         self._nsa_k_only_warmup_steps[req.req_pool_idx] = warmup_steps
+        self._naive_swap_in_steps[req.req_pool_idx] = warmup_steps
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
     def _preload_to_device_buffer(self, req: Req) -> None:

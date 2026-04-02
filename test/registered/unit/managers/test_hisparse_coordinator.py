@@ -57,7 +57,8 @@ def test_abort_staging_request_preserves_deque_and_frees_host_pool():
     )
     coordinator.mem_pool_host = DummyHostPool()
     coordinator._skip_first_backup = [True, True]
-    coordinator._force_naive_swap_in = [True, True]
+    coordinator._nsa_k_only_warmup_steps = [0, 0]
+    coordinator._naive_swap_in_steps = [1, 1]
 
     coordinator.abort_staging_request(req)
 
@@ -67,7 +68,7 @@ def test_abort_staging_request_preserves_deque_and_frees_host_pool():
     assert coordinator.mem_pool_host.freed[0].tolist() == [11, 12]
     assert coordinator.req_to_host_pool[0].tolist() == [-1, -1, -1]
     assert coordinator._skip_first_backup[0] is False
-    assert coordinator._force_naive_swap_in[0] is False
+    assert coordinator._naive_swap_in_steps[0] == 0
     assert req.staging is False
 
 
@@ -114,7 +115,7 @@ def test_direct_admit_keeps_two_step_nsa_warmup_for_long_sequences():
     coordinator.req_to_device_buffer = torch.arange(16, dtype=torch.int64).view(1, 16)
     coordinator._skip_first_backup = [False]
     coordinator._nsa_k_only_warmup_steps = [0]
-    coordinator._force_naive_swap_in = [False]
+    coordinator._naive_swap_in_steps = [0]
     coordinator.req_device_buffer_tokens = torch.zeros((1, 1, 5), dtype=torch.int32)
 
     def alloc_device_buffer(req):
@@ -131,7 +132,7 @@ def test_direct_admit_keeps_two_step_nsa_warmup_for_long_sequences():
     assert coordinator.should_force_nsa_k_only(torch.tensor([0], dtype=torch.int64))
     assert coordinator._skip_first_backup == [True]
     assert coordinator._nsa_k_only_warmup_steps == [2]
-    assert coordinator._force_naive_swap_in == [True]
+    assert coordinator._naive_swap_in_steps == [2]
     assert coordinator.req_device_buffer_tokens[0, 0, :4].tolist() == [5, 6, 7, -1]
     assert len(coordinator.mem_pool_host.loads) == 1
 
@@ -165,7 +166,7 @@ def test_swap_in_selected_pages_uses_naive_fallback_for_flagged_req():
     coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
     coordinator.device = "cpu"
     coordinator.top_k = 4
-    coordinator._force_naive_swap_in = [True]
+    coordinator._naive_swap_in_steps = [1]
 
     called = {}
 
@@ -193,6 +194,7 @@ def test_swap_in_selected_pages_uses_naive_fallback_for_flagged_req():
     assert seq_lens.tolist() == [8]
     assert top_k_tokens.tolist() == [[1, 2, 3, 4]]
     assert layer_id == 2
+    assert coordinator._naive_swap_in_steps == [1]
 
 
 def test_naive_load_topk_tolerates_invalid_or_missing_host_tokens():
