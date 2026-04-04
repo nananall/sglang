@@ -621,12 +621,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             hisparse_cfg = parse_hisparse_config(self.server_args)
-            force_naive_swap_in = self.server_args.disaggregation_mode == "decode"
+            # PD decode defaults to naive swap-in for stability unless explicitly enabled
+            force_naive_swap_in = (
+                self.server_args.disaggregation_mode == "decode"
+                and not self.server_args.hisparse_pd_enable_jit
+            )
             if force_naive_swap_in:
                 logger.warning(
-                    "HiSparse PD decode is forcing the conservative decode "
-                    "path (k-only indexer + naive swap-in) because the "
-                    "optimized sparse decode path is still unstable under load."
+                    "HiSparse PD decode is using the conservative decode "
+                    "path (k-only indexer + naive swap-in). To enable the "
+                    "optimized JIT fast path, add --hisparse-pd-enable-jit "
+                    "after verifying kernel stability in your environment."
+                )
+            elif (
+                self.server_args.disaggregation_mode == "decode"
+                and self.server_args.hisparse_pd_enable_jit
+            ):
+                logger.info(
+                    "HiSparse PD decode JIT fast path enabled. "
+                    "Make sure kernel stability has been verified in your environment."
                 )
             self.hisparse_coordinator = HiSparseCoordinator(
                 req_to_token_pool=self.req_to_token_pool,
