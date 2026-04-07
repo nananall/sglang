@@ -649,13 +649,15 @@ class DeepseekV2Config(PretrainedConfig):
 
 class DeepseekVL2Config(PretrainedConfig):
     model_type = "deepseek_vl_v2"
-    vision_config: DeepseekVL2VisionEncoderConfig = None
-    projector_config: DeepseekVL2MlpProjectorConfig = None
-    language_config: DeepseekV2Config = None
 
-    tile_tag: str = "2D"
-    global_view_pos: str = "head"
-    candidate_resolutions: Tuple[Tuple[int, int]] = ((384, 384),)
+    def __init__(
+        self,
+        tile_tag: str = "tile_tag",
+        global_view_pos: str = "head",
+        candidate_resolutions: Tuple[Tuple[int, int]] = ((384, 384),),
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
 
     def __init__(
         self,
