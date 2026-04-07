@@ -213,7 +213,10 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 
 
 if is_blackwell_supported() and is_flashinfer_available():
-    from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
+    try:
+        from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
+    except ImportError:
+        from flashinfer import bmm_mxfp8 as _raw_flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
 
