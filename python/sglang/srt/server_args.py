@@ -6607,7 +6607,7 @@ class ServerArgs:
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 hisparse_cfg = parse_hisparse_config(self)
-                hisparse_page_size = getattr(hisparse_cfg, "page_size", 64)
+                hisparse_page_size = getattr(hisparse_cfg, "page_size", None) or self.page_size
                 max_draft = self.speculative_num_draft_tokens or 0
                 if max_draft >= hisparse_page_size:
                     raise ValueError(
