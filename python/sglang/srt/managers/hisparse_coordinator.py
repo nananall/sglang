@@ -602,8 +602,13 @@ class HiSparseCoordinator:
             req_pool_indices, self.device_buffer_size
         ]
 
-        # Vectorized: set skip flag for all requests
-        self._skip_first_backup[req_pool_indices] = True
+        # Set skip flag for all requests.
+        # _skip_first_backup is a Python list so it must be indexed with Python
+        # ints, not a CUDA tensor — using a tensor index silently does nothing
+        # (or raises TypeError) and leaves the flag unset, which causes the next
+        # _eager_backup_previous_token call to back up the wrong KV slot.
+        for idx in req_pool_indices.cpu().tolist():
+            self._skip_first_backup[idx] = True
 
         # Compute segment boundaries: cumsum gives end offsets
         offsets = torch.cat(
