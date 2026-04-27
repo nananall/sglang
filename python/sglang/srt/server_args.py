@@ -1700,6 +1700,13 @@ class ServerArgs:
                     self._set_default_nsa_kv_cache_dtype(major, self.quantization)
                     self._set_default_nsa_backends(self.kv_cache_dtype, major)
 
+                    # Enable multi-layer EAGLE for GlmMoeDsaForCausalLM when using speculative decoding
+                    if model_arch == "GlmMoeDsaForCausalLM" and self.speculative_algorithm == "EAGLE":
+                        self.enable_multi_layer_eagle = True
+                        logger.info(
+                            "Enable multi-layer EAGLE speculative decoding for GlmMoeDsaForCausalLM model."
+                        )
+
                 if self.enable_nsa_prefill_context_parallel:
                     assert (
                         self.disaggregation_mode != "decode"
