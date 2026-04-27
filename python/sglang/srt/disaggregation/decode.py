@@ -1047,9 +1047,14 @@ class DecodeTransferQueue:
         decode_req.req.cached_tokens_host = cached_tokens[2].item()
         decode_req.req.cached_tokens_storage = cached_tokens[3].item()
         if not self.spec_algorithm.is_none():
-            decode_req.req.output_topk_p = output_topk_p
-            decode_req.req.output_topk_index = output_topk_index
-            decode_req.req.hidden_states_tensor = output_hidden_states
+            # Clone to ensure the req owns independent copies of these tensors.
+            # output_topk_p/index/hidden_states are views into the shared MetadataBuffers;
+            # the corresponding slot (idx) is freed at the end of the same pop_transferred()
+            # call, so without clone the slot can be overwritten by a new request before
+            # process_prebuilt() consumes these fields, corrupting the first-round draft input.
+            decode_req.req.output_topk_p = output_topk_p.clone()
+            decode_req.req.output_topk_index = output_topk_index.clone()
+            decode_req.req.hidden_states_tensor = output_hidden_states.clone()
 
         if decode_req.req.return_logprob:
             decode_req.req.output_token_logprobs_val.append(
