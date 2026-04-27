@@ -1055,6 +1055,13 @@ class DecodeTransferQueue:
             decode_req.req.output_topk_p = output_topk_p.clone()
             decode_req.req.output_topk_index = output_topk_index.clone()
             decode_req.req.hidden_states_tensor = output_hidden_states.clone()
+            logger.debug(
+                "[commit_transfer] rid=%s topk_p=%s topk_index=%s hidden_states.shape=%s",
+                decode_req.req.rid,
+                decode_req.req.output_topk_p,
+                decode_req.req.output_topk_index,
+                decode_req.req.hidden_states_tensor.shape,
+            )
 
         if decode_req.req.return_logprob:
             decode_req.req.output_token_logprobs_val.append(

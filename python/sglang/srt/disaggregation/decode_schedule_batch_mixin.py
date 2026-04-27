@@ -162,6 +162,18 @@ class ScheduleBatchDisaggregationDecodeMixin:
             hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
 
+            logger.debug(
+                "[process_prebuilt] topk_p=%s topk_index=%s hidden_states.shape=%s "
+                "num_states=%d eagle_topk=%d num_steps=%d enable_mtp=%s",
+                topk_p,
+                topk_index,
+                hidden_states.shape,
+                num_states,
+                server_args.speculative_eagle_topk,
+                server_args.speculative_num_steps,
+                server_args.enable_multi_layer_eagle,
+            )
+
             # local import to avoid circular import
             from sglang.srt.speculative.eagle_info import EagleDraftInput
 
