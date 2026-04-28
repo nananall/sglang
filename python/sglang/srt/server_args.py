@@ -1701,11 +1701,16 @@ class ServerArgs:
                     self._set_default_nsa_backends(self.kv_cache_dtype, major)
 
                     # Enable multi-layer EAGLE for GlmMoeDsaForCausalLM when using speculative decoding
-                    if model_arch == "GlmMoeDsaForCausalLM" and self.speculative_algorithm == "EAGLE":
+                    if "GlmMoeDsaForCausalLM" in model_arch and self.speculative_algorithm == "EAGLE":
                         self.enable_multi_layer_eagle = True
                         logger.info(
                             "Enable multi-layer EAGLE speculative decoding for GlmMoeDsaForCausalLM model."
                         )
+                        if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                            envs.SGLANG_ENABLE_SPEC_V2.set(True)
+                            logger.warning(
+                                "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
+                            )
 
                 if self.enable_nsa_prefill_context_parallel:
                     assert (
