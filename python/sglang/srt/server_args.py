@@ -1706,11 +1706,6 @@ class ServerArgs:
                         logger.info(
                             "Enable multi-layer EAGLE speculative decoding for GlmMoeDsaForCausalLM model."
                         )
-                        if not envs.SGLANG_ENABLE_SPEC_V2.get():
-                            envs.SGLANG_ENABLE_SPEC_V2.set(True)
-                            logger.warning(
-                                "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
-                            )
 
                 if self.enable_nsa_prefill_context_parallel:
                     assert (
