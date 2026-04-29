@@ -1700,11 +1700,19 @@ class ServerArgs:
                     self._set_default_nsa_kv_cache_dtype(major, self.quantization)
                     self._set_default_nsa_backends(self.kv_cache_dtype, major)
 
-                    # Enable multi-layer EAGLE for GlmMoeDsaForCausalLM when using speculative decoding
-                    if "GlmMoeDsaForCausalLM" in model_arch and self.speculative_algorithm == "EAGLE":
+                    # Enable multi-layer EAGLE for NSA models when using speculative decoding
+                    # MTP models need multi-layer EAGLE to correctly handle multi-step
+                    # draft tree generation in process_prebuilt (num_states = topk * steps)
+                    nsa_mtp_models = [
+                        "DeepseekV32ForCausalLM",
+                        "DeepseekV3ForCausalLM",
+                        "GlmMoeDsaForCausalLM",
+                    ]
+                    if any(m in model_arch for m in nsa_mtp_models) and self.speculative_algorithm == "EAGLE":
                         self.enable_multi_layer_eagle = True
                         logger.info(
-                            "Enable multi-layer EAGLE speculative decoding for GlmMoeDsaForCausalLM model."
+                            "Enable multi-layer EAGLE speculative decoding for %s model.",
+                            model_arch,
                         )
 
                 if self.enable_nsa_prefill_context_parallel:
