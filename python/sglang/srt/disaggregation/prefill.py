@@ -37,8 +37,6 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
     is_mla_backend,
-    kv_to_page_indices,
-    kv_to_page_num,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
 )
@@ -49,7 +47,13 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import (
+    kv_to_page_indices,
+    kv_to_page_num,
+    maybe_cache_unfinished_req,
+    page_align_floor,
+    release_kv_cache,
+)
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
@@ -333,6 +337,22 @@ class PrefillBootstrapQueue:
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
+            # Read decode_prefix_len from transfer info to know which KV pages
+            # are already cached on the decode side (radix cache hit).
+            if req.bootstrap_room in kv_mgr.transfer_infos:
+                for tinfo in kv_mgr.transfer_infos[req.bootstrap_room].values():
+                    req.decode_prefix_len = tinfo.decode_prefix_len
+                    if req.decode_prefix_len > 0:
+                        # Align to page boundary for consistency
+                        page_size = self.token_to_kv_pool.page_size
+                        if req.decode_prefix_len % page_size != 0:
+                            req.decode_prefix_len = page_align_floor(
+                                req.decode_prefix_len, page_size
+                            )
+                        # Skip already-cached prefix pages in KV transfer
+                        req.start_send_idx = req.decode_prefix_len
+                    break
+
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
             req.time_stats.set_wait_queue_entry_time()
@@ -392,6 +412,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            if self._engine_paused:
+                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -423,6 +445,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            if self._engine_paused:
+                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -501,7 +525,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
-                self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                maybe_cache_unfinished_req(req, self.tree_cache)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
@@ -712,7 +736,7 @@ class SchedulerDisaggregationPrefillMixin:
         chunked_req_to_exclude = set()
         if self.chunked_req:
             chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+            maybe_cache_unfinished_req(self.chunked_req, self.tree_cache, chunked=True)
             if self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(

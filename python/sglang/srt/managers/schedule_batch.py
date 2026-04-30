@@ -860,6 +860,10 @@ class Req(ReqDllmMixin):
         # start_send_idx = len(req.fill_ids)
         self.start_send_idx: int = 0
 
+        # Number of prefix tokens already cached on the decode side (radix cache hit).
+        # When > 0, the prefill server can skip sending these KV pages during transfer.
+        self.decode_prefix_len: int = 0
+
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.

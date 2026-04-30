@@ -105,6 +105,10 @@ class FakeKVReceiver(BaseKVReceiver):
         kv_indices: list[int],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        # codeflicker-fix: COMPAT-Issue-003/s5iela9m6lrqwnrb1ilf
+        # Fake backend does NOT support decode radix cache — decode_prefix_len
+        # is accepted for interface compatibility but not wired through.
+        decode_prefix_len: Optional[int] = None,
     ):
         self.has_sent_metadata = True
         logger.debug(

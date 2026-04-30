@@ -60,6 +60,10 @@ def _unpack_mem_desc_list(blob: bytes) -> List[MemoryDesc]:
 
 @dataclasses.dataclass
 class TransferInfo:
+    # codeflicker-fix: COMPAT-Issue-003/s5iela9m6lrqwnrb1ilf
+    # NOTE: mori backend does NOT support decode radix cache.
+    # decode_prefix_len is not parsed from ZMQ wire and always defaults to 0,
+    # meaning prefill will always transfer full KV (no prefix-page skipping).
     room: int
     endpoint: str
     dst_port: int
@@ -1033,6 +1037,10 @@ class MoriKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        # codeflicker-fix: COMPAT-Issue-003/s5iela9m6lrqwnrb1ilf
+        # mori backend does NOT support decode radix cache — decode_prefix_len
+        # is accepted for interface compatibility but not written to wire.
+        decode_prefix_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None or self.bootstrap_room is None:
             return
