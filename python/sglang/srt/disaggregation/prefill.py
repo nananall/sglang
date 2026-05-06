@@ -339,8 +339,8 @@ class PrefillBootstrapQueue:
 
             # Read decode_prefix_len from transfer info to know which KV pages
             # are already cached on the decode side (radix cache hit).
-            if req.bootstrap_room in kv_mgr.transfer_infos:
-                for tinfo in kv_mgr.transfer_infos[req.bootstrap_room].values():
+            if req.bootstrap_room in self.kv_manager.transfer_infos:
+                for tinfo in self.kv_manager.transfer_infos[req.bootstrap_room].values():
                     req.decode_prefix_len = tinfo.decode_prefix_len
                     if req.decode_prefix_len > 0:
                         # Align to page boundary for consistency
