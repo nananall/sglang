@@ -51,12 +51,12 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
-from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
+    MatchPrefixParams,
 )
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
@@ -444,12 +444,17 @@ class DecodePreallocQueue:
             self.pending_reqs.append(decode_req)
 
     def _match_prefix_and_lock(self, req: Req) -> Tuple[torch.Tensor, int]:
-        result = match_prefix_for_req(
-            self.tree_cache,
-            req,
-            req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
-            include_req=True,
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        result = self.tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids=req.origin_input_ids,
+                    extra_key=req.extra_key,
+                ),
+                cow_mamba=self.tree_cache.supports_mamba(),
+                req=req,
+            )
         )
         prefix_indices = result.device_indices
         last_device_node = result.last_device_node
