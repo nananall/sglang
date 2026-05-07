@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -480,7 +481,17 @@ class SchedulerOutputProcessorMixin:
                 else:
                     if self.enable_hisparse:
                         self.hisparse_coordinator.request_finished(req)
+                    t_cache = time.perf_counter()
                     release_kv_cache(req, self.tree_cache)
+                    dt_cache = time.perf_counter() - t_cache
+                    if envs.SGLANG_DISAGG_RADIX_DEBUG.get():
+                        logger.info(
+                            f"[disagg-radix-debug][decode-finish] "
+                            f"rid={req.rid} "
+                            f"output_tokens={len(req.output_ids)} "
+                            f"cache_protected_len={req.cache_protected_len} "
+                            f"cache_finished_ms={dt_cache*1000:.2f}"
+                        )
 
                 req.time_stats.set_completion_time()
 

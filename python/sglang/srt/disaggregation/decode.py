@@ -1355,39 +1355,67 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
+        self._debug_loop_count = 0
 
         while True:
+            self._debug_loop_count += 1
+            loop_start = time.perf_counter()
+
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            t0 = time.perf_counter()
             self.process_decode_queue()
+            t_process_queue = time.perf_counter() - t0
+
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
+            t0 = time.perf_counter()
             batch = self.get_next_disagg_decode_batch_to_run()
+            t_get_batch = time.perf_counter() - t0
             self.cur_batch = batch
 
             # Launch the current batch
+            t0 = time.perf_counter()
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+                t_run_batch = time.perf_counter() - t0
             else:
                 batch_result = None
+                t_run_batch = 0.0
 
             # Process the last batch
+            t0 = time.perf_counter()
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.self_check_during_idle()
+            t_process_batch = time.perf_counter() - t0
 
             # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
             self.last_batch = batch
+
+            loop_total = time.perf_counter() - loop_start
+            if envs.SGLANG_DISAGG_RADIX_DEBUG.get() and self._debug_loop_count % 100 == 0:
+                logger.info(
+                    f"[disagg-radix-debug][decode-loop] "
+                    f"iter={self._debug_loop_count} "
+                    f"running_reqs={len(self.running_batch.reqs)} "
+                    f"waiting={len(self.waiting_queue)} "
+                    f"total={loop_total*1000:.1f}ms "
+                    f"queue={t_process_queue*1000:.1f}ms "
+                    f"get_batch={t_get_batch*1000:.1f}ms "
+                    f"run_batch={t_run_batch*1000:.1f}ms "
+                    f"process_result={t_process_batch*1000:.1f}ms"
+                )
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
