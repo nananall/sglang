@@ -3241,8 +3241,12 @@ class ServerArgs:
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
-            self.disable_radix_cache = True
-            logger.warning("KV cache is forced as chunk cache for decode server")
+            if self.disaggregation_decode_enable_radix_cache:
+                # Radix cache is explicitly requested for decode side; keep it enabled.
+                pass
+            else:
+                self.disable_radix_cache = True
+                logger.warning("KV cache is forced as chunk cache for decode server")
 
         elif self.disaggregation_mode == "prefill":
             assert (
