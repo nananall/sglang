@@ -1217,22 +1217,6 @@ class DecodeTransferQueue:
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
-
-        # KV transfer is complete: insert the received KV into the decode-side
-        # radix cache now that the data is valid. This must happen AFTER the
-        # transfer is confirmed so we don't insert stale/empty pages.
-        if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
-            req = decode_req.req
-            # Save the prefix length established during prealloc (_match_prefix_and_lock).
-            prealloc_prefix_len = len(req.prefix_indices)
-            self.tree_cache.cache_unfinished_req(req)
-            # cache_unfinished_req updates req.prefix_indices to cover the full
-            # fill_ids range (all KV is now in the tree). Restore it back to the
-            # prealloc prefix length so that prepare_for_prebuilt computes the
-            # correct extend_input_len = fill_len - prefix_len.
-            req.prefix_indices = req.prefix_indices[:prealloc_prefix_len]
-            req.set_extend_input_len(len(req.fill_ids) - prealloc_prefix_len)
-
         return True
 
     def _poll_with_staging(self) -> list:
