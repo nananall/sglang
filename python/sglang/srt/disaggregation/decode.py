@@ -458,8 +458,11 @@ class DecodePreallocQueue:
         )
         prefix_indices = result.device_indices
         last_device_node = result.last_device_node
-        # Always lock to match aggregated scheduling behavior
+        # Always lock to match aggregated scheduling behavior.
+        # Also store the node on req so that cache_unfinished_req / cache_finished_req
+        # can correctly dec_lock_ref it later.
         self.tree_cache.inc_lock_ref(last_device_node)
+        req.last_node = last_device_node
         return prefix_indices, len(prefix_indices)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
