@@ -866,6 +866,13 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            if envs.SGLANG_DISAGG_RADIX_DEBUG.get():
+                logger.info(
+                    f"[disagg-radix-debug][decode] rid={decode_req.req.rid} "
+                    f"input_len={origin_input_len} "
+                    f"prefix_len={prefix_len} "
+                    f"suffix_to_transfer={origin_input_len - prefix_len}"
+                )
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,

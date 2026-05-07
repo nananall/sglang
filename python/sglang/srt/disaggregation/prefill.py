@@ -351,6 +351,13 @@ class PrefillBootstrapQueue:
                             )
                         # Skip already-cached prefix pages in KV transfer
                         req.start_send_idx = req.decode_prefix_len
+                    if envs.SGLANG_DISAGG_RADIX_DEBUG.get():
+                        logger.info(
+                            f"[disagg-radix-debug][prefill] rid={req.rid} "
+                            f"decode_prefix_len={req.decode_prefix_len} "
+                            f"start_send_idx={req.start_send_idx} "
+                            f"suffix_to_transfer={len(req.origin_input_ids) - req.start_send_idx}"
+                        )
                     break
 
             bootstrapped_reqs.append(req)
