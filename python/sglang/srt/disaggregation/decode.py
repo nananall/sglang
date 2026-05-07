@@ -1085,6 +1085,11 @@ class DecodePreallocQueue:
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
         req.set_extend_input_len(len(req.fill_ids) - prefix_len)
+        # The prefix pages are already in the radix tree (from match_prefix).
+        # cache_unfinished_req frees kv_indices[cache_protected_len:new_prefix_len]
+        # as "duplicates already in the tree". We must protect the prefix range
+        # from being freed so those shared radix pages are not double-freed.
+        req.cache_protected_len = prefix_len
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:

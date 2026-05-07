@@ -109,7 +109,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.output_ids = []
         for req in self.reqs:
             self.output_ids.append(req.output_ids[-1])
-            self.tree_cache.cache_unfinished_req(req)
+            # When decode-side radix cache is enabled, _pre_alloc already set
+            # req.prefix_indices / req.last_node / req.cache_protected_len.
+            # cache_unfinished_req would re-insert the entire fill_ids KV and
+            # then free newly-allocated suffix pages (treating them as radix
+            # duplicates), corrupting the RDMA transfer destination buffers.
+            # Skip it here; cache_finished_req via release_kv_cache handles
+            # tree insertion when the request completes normally.
+            if not server_args.disaggregation_decode_enable_radix_cache:
+                self.tree_cache.cache_unfinished_req(req)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
