@@ -1010,6 +1010,21 @@ class Scheduler(
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.server_args.disaggregation_decode_enable_radix_cache
+            and draft_token_to_kv_pool is not None
+        ):
+            raise ValueError(
+                "Decode-side radix cache is not yet compatible with EAGLE/STANDALONE "
+                "speculative decoding. When decode radix cache is enabled, the prefix-skip "
+                "optimization adjusts the main-model KV transfer range (via decode_prefix_len), "
+                "but the draft-model KV transfer range is not adjusted accordingly. This causes "
+                "the draft KV to be written to the wrong addresses on the decode side, corrupting "
+                "speculative decoding hidden states. Disable one of --disaggregation-decode-enable-radix-cache "
+                "or speculative decoding (--speculative-algorithm)."
+            )
+
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
             buffer_size = (self.req_to_token_pool.size) * 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
