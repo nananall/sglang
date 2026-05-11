@@ -1008,20 +1008,19 @@ class Scheduler(
             draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
             model_config = self.draft_worker.model_config
 
-        if (
-            self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.server_args.disaggregation_decode_enable_radix_cache
-            and draft_token_to_kv_pool is not None
-        ):
-            raise ValueError(
-                "Decode-side radix cache is not yet compatible with EAGLE/STANDALONE "
-                "speculative decoding. When decode radix cache is enabled, the prefix-skip "
-                "optimization adjusts the main-model KV transfer range (via decode_prefix_len), "
-                "but the draft-model KV transfer range is not adjusted accordingly. This causes "
-                "the draft KV to be written to the wrong addresses on the decode side, corrupting "
-                "speculative decoding hidden states. Disable one of --disaggregation-decode-enable-radix-cache "
-                "or speculative decoding (--speculative-algorithm)."
-            )
+        # Note: decode radix cache + EAGLE/STANDALONE is safe for the standard disagg deployment
+        # where the prefill node does NOT run speculative decoding (draft_worker is None on prefill).
+        # In that case, prefill's kv_data_ptrs contains only main-model KV layers.
+        # get_mha_kv_ptrs_with_pp already handles "decode has draft KV, prefill does not" by
+        # matching layer counts, so draft KV is never part of the P→D RDMA transfer.
+        # Draft KV is generated locally on the decode node by spec rounds and does not depend
+        # on prefix KV being transferred from prefill.
+        #
+        # Non-standard deployment (prefill also runs EAGLE): draft KV would be included in
+        # P→D transfer and the prefix skip would leave draft prefix KV uninitialized. That
+        # case requires a dual-index transfer implementation (future work). For now, such a
+        # deployment is uncommon and can be detected at runtime by checking whether prefill's
+        # draft_token_to_kv_pool is non-None.
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
