@@ -714,6 +714,16 @@ class Scheduler(
             or self.tp_worker.model_runner.mamba2_config is not None
         )
 
+        if server_args.disaggregation_decode_enable_radix_cache and (
+            self.is_hybrid_swa or self.is_hybrid_ssm
+        ):
+            raise ValueError(
+                "Decode-side radix cache is not compatible with hybrid SWA/SSM models. "
+                "The hybrid page-allocation strategy splits the KV pool into separate "
+                "full-attention and local-attention/Mamba regions, which conflicts with "
+                "the radix cache's page layout assumptions in decode-disagg mode."
+            )
+
         self.sliding_window_size = None
         if self.is_hybrid_swa:
             self.sliding_window_size = self.tp_worker.sliding_window_size
