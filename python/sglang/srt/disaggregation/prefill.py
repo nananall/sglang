@@ -334,9 +334,6 @@ class PrefillBootstrapQueue:
             )
             assert req.metadata_buffer_index is not None
 
-            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
-            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
-
             # Read decode_prefix_len from transfer info to know which KV pages
             # are already cached on the decode side (radix cache hit).
             if req.bootstrap_room in self.kv_manager.transfer_infos:
@@ -359,6 +356,12 @@ class PrefillBootstrapQueue:
                             f"suffix_to_transfer={len(req.origin_input_ids) - req.start_send_idx}"
                         )
                     break
+
+            num_kv_indices_to_send = max(0, num_kv_indices - req.start_send_idx)
+            num_pages = kv_to_page_num(
+                num_kv_indices_to_send, self.token_to_kv_pool.page_size
+            )
+            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
@@ -840,7 +843,16 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = kv_to_page_indices(state_indices, page_size)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
-        if len(page_indices) == 0:
+        num_pages = len(page_indices)
+        should_send_kv_chunk = getattr(
+            req.disagg_kv_sender, "should_send_kv_chunk", None
+        )
+        if should_send_kv_chunk is None:
+            should_send = num_pages > 0
+        else:
+            should_send = should_send_kv_chunk(num_pages, last_chunk)
+
+        if not should_send:
             logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )

@@ -813,14 +813,23 @@ class DecodePreallocQueue:
             if self.scheduler.enable_hisparse:
                 # Must cast to int32 for ZMQ serialization — from_zmq reads np.int32.
                 kv_indices = (
-                    dst_kv_indices[:origin_input_len].cpu().numpy().astype(np.int32)
+                    dst_kv_indices[: origin_input_len - prefix_len]
+                    .cpu()
+                    .numpy()
+                    .astype(np.int32)
                 )
                 page_size = 1  # host pool page_size
             else:
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx
-                ][:origin_input_len]
-                kv_indices = kv_indices_full.cpu().numpy()
+                # Only ask prefill to transfer the delta pages beyond the
+                # decode-side radix-cache hit. The cached prefix pages are
+                # already resident and protected on decode.
+                kv_indices = (
+                    self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
+                        prefix_len:origin_input_len
+                    ]
+                    .cpu()
+                    .numpy()
+                )
                 page_size = self.token_to_kv_pool_allocator.page_size
 
             # Prepare extra pool indices for hybrid models
@@ -1011,6 +1020,30 @@ class DecodePreallocQueue:
         # TODO(retraction): when retraction is implemented with radix cache
         # awareness, a retracted request should re-match the tree here
         delta_len = fill_len - prefix_len
+        required_alloc_tokens = self._required_alloc_tokens(
+            fill_len=fill_len, prefix_len=prefix_len
+        )
+
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        if (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and available_size < required_alloc_tokens
+        ):
+            num_to_evict = required_alloc_tokens - available_size
+            result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
+            available_size = self.token_to_kv_pool_allocator.available_size()
+            if available_size < required_alloc_tokens:
+                logger.warning(
+                    f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
+                    f"available {available_size} "
+                    f"after evicting {result.num_tokens_evicted}/{num_to_evict} tokens. "
+                    f"evictable_size={self.tree_cache.evictable_size()}, "
+                    f"protected_size={self.tree_cache.protected_size()}, "
+                    f"fill_len={fill_len}, prefix_len={prefix_len}, "
+                    f"delta_len={delta_len}, "
+                    f"page_size={self.token_to_kv_pool_allocator.page_size}, "
+                    f"req={req.rid}"
+                )
 
         if self.scheduler.enable_hisparse:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
@@ -1064,7 +1097,8 @@ class DecodePreallocQueue:
             f"available={self.token_to_kv_pool_allocator.available_size()}, "
             f"evictable={self.tree_cache.evictable_size()}, "
             f"protected={self.tree_cache.protected_size()}, "
-            f"delta={delta_len}, fill={fill_len}, prefix={prefix_len}, "
+            f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
+            f"fill={fill_len}, prefix={prefix_len}, "
             f"page_size={self.token_to_kv_pool_allocator.page_size}, "
             f"req={req.rid}"
         )
