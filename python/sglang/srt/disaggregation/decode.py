@@ -1439,17 +1439,19 @@ class SchedulerDisaggregationDecodeMixin:
 
             loop_total = time.perf_counter() - loop_start
             if envs.SGLANG_DISAGG_RADIX_DEBUG.get() and self._debug_loop_count % 100 == 0:
-                logger.info(
-                    f"[disagg-radix-debug][decode-loop] "
-                    f"iter={self._debug_loop_count} "
-                    f"running_reqs={len(self.running_batch.reqs)} "
-                    f"waiting={len(self.waiting_queue)} "
-                    f"total={loop_total*1000:.1f}ms "
-                    f"queue={t_process_queue*1000:.1f}ms "
-                    f"get_batch={t_get_batch*1000:.1f}ms "
-                    f"run_batch={t_run_batch*1000:.1f}ms "
-                    f"process_result={t_process_batch*1000:.1f}ms"
-                )
+                # Only log when there is actual activity to avoid spamming during idle
+                if len(self.running_batch.reqs) > 0 or batch is not None or self.last_batch is not None:
+                    logger.info(
+                        f"[disagg-radix-debug][decode-loop] "
+                        f"iter={self._debug_loop_count} "
+                        f"running_reqs={len(self.running_batch.reqs)} "
+                        f"waiting={len(self.waiting_queue)} "
+                        f"total={loop_total*1000:.1f}ms "
+                        f"queue={t_process_queue*1000:.1f}ms "
+                        f"get_batch={t_get_batch*1000:.1f}ms "
+                        f"run_batch={t_run_batch*1000:.1f}ms "
+                        f"process_result={t_process_batch*1000:.1f}ms"
+                    )
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
