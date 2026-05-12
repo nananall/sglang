@@ -67,6 +67,14 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
         server_args.disable_radix_cache
     ), "Hierarchical sparse attention currently requires --disable-radix-cache."
 
+    assert server_args.speculative_algorithm is None, (
+        "--enable-hisparse is incompatible with speculative decoding "
+        f"(--speculative-algorithm {server_args.speculative_algorithm}). "
+        "See Bug §1 §2: target_verify reads prefix KV via "
+        "full_to_hisparse_device_index_mapping (already zeroed by alloc_device_buffer) "
+        "instead of swap_in, and map_last_loc_to_buffer is never called on spec paths."
+    )
+
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
     if is_v4_hisparse:
